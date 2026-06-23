@@ -1,8 +1,8 @@
 {
   "name": "plex",
-  "displayName": "Plex & Media Stack",
+  "displayName": "Plex & the Arr Stack",
   "version": "0.1.2",
-  "description": "Dashboard and controls for Plex, Sonarr, Radarr, Tautulli, downloads, and more",
+  "description": "Dashboard and AI controls for Plex and the arr stack",
   "author": "Kyle Boyer",
   "icon": {
     "lucide": "Tv"
