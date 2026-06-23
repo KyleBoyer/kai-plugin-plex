@@ -1,10 +1,12 @@
 {
   "name": "plex",
   "displayName": "Plex & Media Stack",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Dashboard and controls for Plex, Sonarr, Radarr, Tautulli, downloads, and more",
   "author": "Kyle Boyer",
-  "icon": { "lucide": "Tv" },
+  "icon": {
+    "lucide": "Tv"
+  },
   "permissions": [
     "config:read",
     "config:write",
@@ -20,25 +22,54 @@
   "configSchema": {
     "type": "object",
     "properties": {
-      "plex":        { "$ref": "#/$defs/service" },
-      "radarr":      { "$ref": "#/$defs/service" },
-      "sonarr":      { "$ref": "#/$defs/service" },
-      "tautulli":    { "$ref": "#/$defs/service" },
-      "bazarr":      { "$ref": "#/$defs/service" },
-      "prowlarr":    { "$ref": "#/$defs/service" },
-      "seer":        { "$ref": "#/$defs/service" },
-      "sabnzbd":     { "$ref": "#/$defs/service" },
-      "qbittorrent": { "$ref": "#/$defs/service" },
-      "tdarr":       { "$ref": "#/$defs/service" },
-      "wizarr":      { "$ref": "#/$defs/service" }
+      "plex": {
+        "$ref": "#/$defs/service"
+      },
+      "radarr": {
+        "$ref": "#/$defs/service"
+      },
+      "sonarr": {
+        "$ref": "#/$defs/service"
+      },
+      "tautulli": {
+        "$ref": "#/$defs/service"
+      },
+      "bazarr": {
+        "$ref": "#/$defs/service"
+      },
+      "prowlarr": {
+        "$ref": "#/$defs/service"
+      },
+      "seer": {
+        "$ref": "#/$defs/service"
+      },
+      "sabnzbd": {
+        "$ref": "#/$defs/service"
+      },
+      "qbittorrent": {
+        "$ref": "#/$defs/service"
+      },
+      "tdarr": {
+        "$ref": "#/$defs/service"
+      },
+      "wizarr": {
+        "$ref": "#/$defs/service"
+      }
     },
     "$defs": {
       "service": {
         "type": "object",
         "properties": {
-          "url":     { "type": "string" },
-          "apiKey":  { "type": "string" },
-          "enabled": { "type": "boolean", "default": true }
+          "url": {
+            "type": "string"
+          },
+          "apiKey": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          }
         }
       }
     }
