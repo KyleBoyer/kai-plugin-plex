@@ -1,7 +1,7 @@
 {
   "name": "plex",
   "displayName": "Plex & Media Stack",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Dashboard and controls for Plex, Sonarr, Radarr, Tautulli, downloads, and more",
   "author": "Kyle Boyer",
   "icon": {
