@@ -106,7 +106,14 @@ export class SonarrClient {
 
   async editSeries(seriesId: number, changes: { qualityProfileId?: number; rootFolderPath?: string }, moveFiles = false): Promise<void> {
     const existing = await this.get<SonarrSeries & Record<string, unknown>>(`/api/v3/series/${seriesId}`);
-    const updated = { ...existing, ...changes };
+    const updated: Record<string, unknown> = { ...existing, ...changes };
+    // When the root folder changes, recompute the full `path`. Sonarr only relocates
+    // files when the submitted `path` differs from the stored one; updating
+    // `rootFolderPath` alone leaves `path` stale and the move is silently skipped.
+    if (changes.rootFolderPath) {
+      const folderName = basename(String(existing.path ?? ''));
+      if (folderName) updated.path = joinPath(changes.rootFolderPath, folderName);
+    }
     const url = moveFiles
       ? this.endpoint(`/api/v3/series/${seriesId}`, { moveFiles: 'true' })
       : this.endpoint(`/api/v3/series/${seriesId}`);
@@ -152,6 +159,14 @@ export class SonarrClient {
       };
     });
   }
+}
+
+function basename(path: string): string {
+  return path.replace(/\/+$/, '').split('/').filter(Boolean).pop() ?? '';
+}
+
+function joinPath(root: string, child: string): string {
+  return `${root.replace(/\/+$/, '')}/${child.replace(/^\/+/, '')}`;
 }
 
 export interface SonarrSeries {

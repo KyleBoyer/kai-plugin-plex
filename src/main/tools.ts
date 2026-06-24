@@ -40,6 +40,7 @@ function stringFilters(...values: unknown[]): string[] {
 
 function numberFilters(...values: unknown[]): number[] {
   return values.flatMap(value => Array.isArray(value) ? value : [value])
+    .filter(value => value != null && value !== '')
     .map(value => Number(value))
     .filter(Number.isFinite);
 }
