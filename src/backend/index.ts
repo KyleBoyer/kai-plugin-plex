@@ -53,6 +53,7 @@ const PLEX_TV_ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 2
 
 let poller: Poller | null = null;
 let unsubConfig: (() => void) | null = null;
+const streamThumbnailLoads = new Map<string, Promise<void>>();
 
 function buildAllClients(api: PluginAPI, config: PluginConfig, fetchFn: typeof fetch): Clients {
   function make<T>(
@@ -83,6 +84,10 @@ function buildAllClients(api: PluginAPI, config: PluginConfig, fetchFn: typeof f
 
 export async function activate(api: PluginAPI): Promise<void> {
   api.log.info('Plex plugin activating');
+
+  if (unsubConfig) { unsubConfig(); unsubConfig = null; }
+  if (poller) { poller.stop(); poller = null; }
+  streamThumbnailLoads.clear();
 
   // Encrypt any plaintext keys left in settings (e.g. from pre-populated settings.json)
   migrateKeys(api);
@@ -235,6 +240,30 @@ async function handlePanelAction(
         api.state.set('searchResults', results);
         api.state.set('searchLoading', false);
       }
+      break;
+    }
+
+    case 'load-stream-thumbnail': {
+      if (!clients.tautulli || !poller) return;
+      const thumb = stringValue(payload.thumb);
+      if (!thumb) return;
+      if (poller.getState().streamThumbnails[thumb]) return;
+
+      let load = streamThumbnailLoads.get(thumb);
+      if (!load) {
+        load = clients.tautulli.getThumbnailDataUrl(thumb)
+          .then(dataUrl => {
+            if (dataUrl && poller) poller.setStreamThumbnail(thumb, dataUrl);
+          })
+          .catch(e => {
+            api.log.warn(`Tautulli thumbnail load failed: ${e}`);
+          })
+          .finally(() => {
+            streamThumbnailLoads.delete(thumb);
+          });
+        streamThumbnailLoads.set(thumb, load);
+      }
+      await load;
       break;
     }
 
@@ -999,6 +1028,7 @@ async function handleSettingsAction(
 }
 
 export async function deactivate(): Promise<void> {
+  streamThumbnailLoads.clear();
   if (unsubConfig) { unsubConfig(); unsubConfig = null; }
   if (poller) { poller.stop(); poller = null; }
 }

@@ -4,6 +4,7 @@ export class TautulliClient {
   private url: string;
   private apiKey: string;
   private fetchFn: typeof fetch;
+  private thumbnailCache = new Map<string, { dataUrl: string; lastUsed: number }>();
 
   constructor(url: string, apiKey: string, fetchFn: typeof fetch) {
     this.url = url.replace(/\/$/, '');
@@ -42,11 +43,19 @@ export class TautulliClient {
     return this.firstImage(s, ['thumb', 'grandparent_thumb', 'parent_thumb']);
   }
 
-  private async thumbnailDataUrl(thumbRaw: string | undefined): Promise<string | undefined> {
-    if (!thumbRaw) return undefined;
+  async getThumbnailDataUrl(thumbRaw: string | undefined): Promise<string | undefined> {
+    const cacheKey = thumbRaw?.trim();
+    if (!cacheKey) return undefined;
+    const now = Date.now();
+    const cached = this.thumbnailCache.get(cacheKey);
+    if (cached) {
+      cached.lastUsed = now;
+      return cached.dataUrl;
+    }
+
     try {
       const res = await this.fetchFn(this.endpoint('pms_image_proxy', {
-        img: thumbRaw,
+        img: cacheKey,
         width: '180',
         height: '270',
         fallback: 'poster',
@@ -55,18 +64,33 @@ export class TautulliClient {
       const contentType = res.headers.get('content-type') ?? '';
       if (!contentType.startsWith('image/')) return undefined;
       const bytes = Buffer.from(await res.arrayBuffer());
-      return `data:${contentType};base64,${bytes.toString('base64')}`;
+      const dataUrl = `data:${contentType};base64,${bytes.toString('base64')}`;
+      this.thumbnailCache.set(cacheKey, { dataUrl, lastUsed: now });
+      this.pruneThumbnailCache();
+      return dataUrl;
     } catch {
       return undefined;
     }
   }
 
-  private async normalizeSession(s: Record<string, unknown>): Promise<TautulliSession> {
+  clearThumbnailCache(): void {
+    this.thumbnailCache.clear();
+  }
+
+  private pruneThumbnailCache(): void {
+    if (this.thumbnailCache.size <= MAX_THUMBNAIL_CACHE_ENTRIES) return;
+    const entries = [...this.thumbnailCache.entries()].sort((a, b) => a[1].lastUsed - b[1].lastUsed);
+    for (const [key] of entries.slice(0, this.thumbnailCache.size - MAX_THUMBNAIL_CACHE_ENTRIES)) {
+      this.thumbnailCache.delete(key);
+    }
+  }
+
+  private async normalizeSession(s: Record<string, unknown>, includeThumbnail: boolean): Promise<TautulliSession> {
     const viewOffset = Number(s.view_offset ?? 0);
     const duration = Number(s.duration ?? 0);
     const progress = duration > 0 ? Math.round((viewOffset / duration) * 100) : 0;
     const thumbRaw = this.streamPosterPath(s);
-    const thumbDataUrl = await this.thumbnailDataUrl(thumbRaw);
+    const thumbDataUrl = includeThumbnail ? await this.getThumbnailDataUrl(thumbRaw) : undefined;
     return {
       sessionKey: String(s.session_key ?? s.session_id ?? ''),
       user: String(s.user ?? s.friendly_name ?? ''),
@@ -104,9 +128,10 @@ export class TautulliClient {
     } catch { return 'unknown'; }
   }
 
-  async getActivity(): Promise<{ sessions: TautulliSession[]; streamCount: number; bandwidth: number }> {
+  async getActivity(options: TautulliActivityOptions = { includeThumbnails: false }): Promise<{ sessions: TautulliSession[]; streamCount: number; bandwidth: number }> {
     const data = await this.call<TautulliActivityRaw>('get_activity');
-    const sessions = await Promise.all((data.sessions ?? []).map(s => this.normalizeSession(s)));
+    const includeThumbnail = options.includeThumbnails === true;
+    const sessions = await Promise.all((data.sessions ?? []).map(s => this.normalizeSession(s, includeThumbnail)));
     return {
       sessions,
       streamCount: Number(data.stream_count ?? 0),
@@ -129,6 +154,12 @@ export class TautulliClient {
   async terminateSession(sessionKey: string, message = 'Stream terminated by admin'): Promise<void> {
     await this.call('terminate_session', { session_key: sessionKey, message });
   }
+}
+
+const MAX_THUMBNAIL_CACHE_ENTRIES = 100;
+
+export interface TautulliActivityOptions {
+  includeThumbnails?: boolean;
 }
 
 interface TautulliActivityRaw {

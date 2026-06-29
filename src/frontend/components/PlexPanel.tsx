@@ -13,8 +13,91 @@ type PluginComponentProps = {
 
 // ─── Streams Tab ─────────────────────────────────────────────────────────────
 
+function StreamPoster({
+  stream,
+  thumbDataUrl,
+  onAction,
+}: {
+  stream: any;
+  thumbDataUrl?: string;
+  onAction: (a: string, d?: unknown) => void;
+}) {
+  const placeholderRef = useRef<HTMLDivElement | null>(null);
+  const requestedRef = useRef(false);
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    requestedRef.current = false;
+    if (retryTimerRef.current) {
+      clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
+    }
+  }, [stream.thumb]);
+
+  useEffect(() => () => {
+    if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+  }, []);
+
+  useEffect(() => {
+    if (!thumbDataUrl) return;
+    requestedRef.current = false;
+    if (retryTimerRef.current) {
+      clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
+    }
+  }, [thumbDataUrl]);
+
+  useEffect(() => {
+    if (!stream.thumb || thumbDataUrl || requestedRef.current) return;
+
+    const requestThumbnail = () => {
+      if (requestedRef.current) return;
+      requestedRef.current = true;
+      onAction('load-stream-thumbnail', { thumb: stream.thumb });
+      retryTimerRef.current = setTimeout(() => {
+        requestedRef.current = false;
+        retryTimerRef.current = null;
+      }, 10_000);
+    };
+
+    const node = placeholderRef.current;
+    if (!node || typeof IntersectionObserver === 'undefined') {
+      requestThumbnail();
+      return;
+    }
+
+    const observer = new IntersectionObserver(entries => {
+      if (entries.some(entry => entry.isIntersecting)) {
+        requestThumbnail();
+        observer.disconnect();
+      }
+    }, { rootMargin: '160px' });
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [stream.thumb, thumbDataUrl, onAction]);
+
+  if (thumbDataUrl) {
+    return (
+      <img
+        src={thumbDataUrl}
+        alt=""
+        className="flex-shrink-0 w-10 h-14 object-cover rounded opacity-90 shadow-sm"
+        loading="lazy"
+        onError={e => { (e.target as HTMLImageElement).style.display = 'none'; }}
+      />
+    );
+  }
+
+  return (
+    <div ref={placeholderRef} className="flex-shrink-0 w-10 h-14 rounded bg-muted/30 border border-border/30 grid place-items-center text-muted-foreground/50 text-xs">
+      {stream.mediaType === 'episode' ? 'TV' : stream.mediaType === 'movie' ? 'MOV' : 'Plex'}
+    </div>
+  );
+}
+
 function StreamsTab({ pluginState, onAction }: { pluginState: any; onAction: (a: string, d?: unknown) => void }) {
   const streams = (pluginState.streams ?? []) as any[];
+  const streamThumbnails = (pluginState.streamThumbnails ?? {}) as Record<string, string>;
   const [terminating, setTerminating] = useState<string | null>(null);
   const [terminateMsg, setTerminateMsg] = useState('Stream terminated by admin');
 
@@ -34,22 +117,11 @@ function StreamsTab({ pluginState, onAction }: { pluginState: any; onAction: (a:
         const fullTitle = s.grandparentTitle ? `${s.grandparentTitle} — ${s.title}` : s.title;
         const isTranscode = s.transcodeDecision !== 'direct play' && s.transcodeDecision !== '';
         const isTerminating = terminating === s.sessionKey;
+        const thumbDataUrl = s.thumbDataUrl ?? (s.thumb ? streamThumbnails[s.thumb] : undefined);
         return (
           <div key={s.sessionKey} className="rounded-lg border border-border/30 bg-muted/10 overflow-hidden">
             <div className="flex gap-3 p-3">
-              {s.thumbDataUrl ? (
-                <img
-                  src={s.thumbDataUrl}
-                  alt=""
-                  className="flex-shrink-0 w-10 h-14 object-cover rounded opacity-90 shadow-sm"
-                  loading="lazy"
-                  onError={e => { (e.target as HTMLImageElement).style.display = 'none'; }}
-                />
-              ) : (
-                <div className="flex-shrink-0 w-10 h-14 rounded bg-muted/30 border border-border/30 grid place-items-center text-muted-foreground/50 text-xs">
-                  {s.mediaType === 'episode' ? 'TV' : s.mediaType === 'movie' ? 'MOV' : 'Plex'}
-                </div>
-              )}
+              <StreamPoster stream={s} thumbDataUrl={thumbDataUrl} onAction={onAction} />
               <div className="flex-1 min-w-0">
                 <div className="flex items-start justify-between gap-2">
                   <div className="flex-1 min-w-0">

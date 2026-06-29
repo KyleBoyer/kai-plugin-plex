@@ -622,7 +622,7 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
           const states = stringFilters(input.state, input.states);
           const transcodeDecisions = stringFilters(input.transcodeDecision, input.transcodeDecisions);
           const { limit, offset } = getPaging(input, 25, 100);
-          const activity = await clients.tautulli.getActivity();
+          const activity = await clients.tautulli.getActivity({ includeThumbnails: false });
           const streams = filterRecords(activity.sessions.map(s => ({
             user: s.user,
             title: s.grandparentTitle ? `${s.grandparentTitle} - ${s.title}` : s.title,

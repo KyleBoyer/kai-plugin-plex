@@ -22,6 +22,12 @@ function jsonResponse(data, init = {}) {
   });
 }
 
+function deferred() {
+  let resolve;
+  const promise = new Promise(r => { resolve = r; });
+  return { promise, resolve };
+}
+
 async function testQbitErrors() {
   const { QbittorrentClient } = await importTs('/Users/kyleboyer/git/kai-plugin-plex/src/main/clients/qbittorrent.ts');
   const client = new QbittorrentClient('http://qbit', 'bad-token', async () => new Response('Forbidden', { status: 403 }));
@@ -70,8 +76,13 @@ async function testSeerTvUsesTmdb() {
 
 async function testTautulliNoApiKeyUrl() {
   const { TautulliClient } = await importTs('/Users/kyleboyer/git/kai-plugin-plex/src/main/clients/tautulli.ts');
+  let imageFetches = 0;
   const client = new TautulliClient('http://tautulli', 'secret-key', async url => {
-    if (String(url).includes('pms_image_proxy')) {
+    const s = String(url);
+    if (s.includes('pms_image_proxy')) {
+      imageFetches += 1;
+      assert.match(s, /width=180/);
+      assert.match(s, /height=270/);
       return new Response(Buffer.from([1, 2, 3]), { status: 200, headers: { 'Content-Type': 'image/png' } });
     }
     return jsonResponse({
@@ -85,11 +96,23 @@ async function testTautulliNoApiKeyUrl() {
       },
     });
   });
-  const activity = await client.getActivity();
+  const activity = await client.getActivity({ includeThumbnails: true });
   assert.equal(activity.sessions[0].thumb, '/library/metadata/1/thumb');
   assert.equal('thumbUrl' in activity.sessions[0], false);
   assert.match(activity.sessions[0].thumbDataUrl, /^data:image\/png;base64,/);
   assert.equal(activity.sessions[0].thumbDataUrl.includes('secret-key'), false);
+
+  const secondActivity = await client.getActivity({ includeThumbnails: true });
+  assert.equal(secondActivity.sessions[0].thumbDataUrl, activity.sessions[0].thumbDataUrl);
+  assert.equal(imageFetches, 1);
+
+  client.clearThumbnailCache();
+  await client.getActivity({ includeThumbnails: true });
+  assert.equal(imageFetches, 2);
+
+  const thumbnailFreeActivity = await client.getActivity();
+  assert.equal(imageFetches, 2);
+  assert.equal(thumbnailFreeActivity.sessions[0].thumbDataUrl, undefined);
 }
 
 async function testPlexLibraryIndexExtractsSectionIds() {
@@ -194,6 +217,84 @@ async function testPollerAttachesPlexLibrarySections() {
   const items = poller.getState().libraryItems;
   assert.equal(items.find(item => item.id === 'radarr-1')?.plexLibrarySectionId, '1');
   assert.equal(items.find(item => item.id === 'sonarr-1')?.plexLibrarySectionId, '2');
+}
+
+async function testPollerDoesNotOverlapFastPolls() {
+  const { Poller } = await importTs('/Users/kyleboyer/git/kai-plugin-plex/src/main/poller.ts');
+  const gate = deferred();
+  let activityCalls = 0;
+  let cacheClears = 0;
+  const api = { state: { set() {} } };
+  const poller = new Poller(api, {
+    tautulli: {
+      getActivity: async () => {
+        activityCalls += 1;
+        await gate.promise;
+        return { sessions: [] };
+      },
+      clearThumbnailCache: () => {
+        cacheClears += 1;
+      },
+    },
+  });
+
+  const first = poller.refreshFast();
+  const second = poller.refreshFast();
+  assert.equal(activityCalls, 1);
+  gate.resolve();
+  await Promise.all([first, second]);
+  assert.equal(activityCalls, 1);
+  poller.stop();
+  assert.equal(cacheClears, 1);
+}
+
+async function testPollerPublishesStreamThumbnailsSeparately() {
+  const { Poller } = await importTs('/Users/kyleboyer/git/kai-plugin-plex/src/main/poller.ts');
+  const stateSets = [];
+  let activityOptions;
+  const api = { state: { set(key, value) { stateSets.push([key, value]); } } };
+  const poller = new Poller(api, {
+    tautulli: {
+      getActivity: async (options) => {
+        activityOptions = options;
+        return {
+        sessions: [{
+          sessionKey: 's1',
+          user: 'Kyle',
+          title: 'Movie',
+          mediaType: 'movie',
+          state: 'playing',
+          viewOffset: 0,
+          duration: 1000,
+          progressPercent: 0,
+          transcodeDecision: 'direct play',
+          qualityProfile: '',
+          bandwidth: 0,
+          ipAddress: '',
+          player: 'Browser',
+          thumb: '/library/metadata/1/thumb',
+        }],
+        streamCount: 1,
+        bandwidth: 0,
+      };
+      },
+      clearThumbnailCache: () => {},
+    },
+  });
+
+  await poller.refreshFast();
+  await poller.refreshFast();
+
+  const thumbnailSets = stateSets.filter(([key]) => key === 'streamThumbnails');
+  assert.equal(thumbnailSets.length, 0);
+  assert.deepEqual(activityOptions, { includeThumbnails: false });
+  assert.equal('thumbDataUrl' in poller.getState().streams[0], false);
+
+  poller.setStreamThumbnail('/library/metadata/1/thumb', 'data:image/png;base64,abc');
+  poller.setStreamThumbnail('/library/metadata/1/thumb', 'data:image/png;base64,abc');
+  const thumbnailSetsAfterLoad = stateSets.filter(([key]) => key === 'streamThumbnails');
+  assert.equal(thumbnailSetsAfterLoad.length, 1);
+  assert.deepEqual(thumbnailSetsAfterLoad[0][1], { '/library/metadata/1/thumb': 'data:image/png;base64,abc' });
 }
 
 async function testBackendRejectsAmbiguousAddDefaults() {
@@ -317,6 +418,8 @@ await testSeerTvUsesTmdb();
 await testTautulliNoApiKeyUrl();
 await testPlexLibraryIndexExtractsSectionIds();
 await testPollerAttachesPlexLibrarySections();
+await testPollerDoesNotOverlapFastPolls();
+await testPollerPublishesStreamThumbnailsSeparately();
 await testBackendRejectsAmbiguousAddDefaults();
 await testListLibraryFiltersAndPages();
 await testGetDownloadsFiltersAndTrimsStatus();

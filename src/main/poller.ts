@@ -93,8 +93,12 @@ export class Poller {
   private clients: Clients;
   private fastTimer: ReturnType<typeof setInterval> | null = null;
   private slowTimer: ReturnType<typeof setInterval> | null = null;
+  private fastPollInFlight: Promise<void> | null = null;
+  private slowPollInFlight: Promise<void> | null = null;
+  private lifecycleId = 0;
   private state: PluginState = {
     streams: [],
+    streamThumbnails: {},
     downloads: [],
     serviceStatus: {},
     libraryStats: [],
@@ -146,6 +150,9 @@ export class Poller {
   }
 
   updateClients(clients: Clients): void {
+    if (this.clients.tautulli && this.clients.tautulli !== clients.tautulli) {
+      this.clients.tautulli.clearThumbnailCache();
+    }
     this.clients = clients;
   }
 
@@ -160,15 +167,21 @@ export class Poller {
   }
 
   start(): void {
-    this.pollFast();
-    this.pollSlow();
-    this.fastTimer = setInterval(() => this.pollFast(), 30_000);
-    this.slowTimer = setInterval(() => this.pollSlow(), 5 * 60_000);
+    if (this.fastTimer || this.slowTimer) return;
+    this.lifecycleId += 1;
+    void this.pollFast().catch(() => undefined);
+    void this.pollSlow().catch(() => undefined);
+    this.fastTimer = setInterval(() => { void this.pollFast().catch(() => undefined); }, 30_000);
+    this.slowTimer = setInterval(() => { void this.pollSlow().catch(() => undefined); }, 5 * 60_000);
   }
 
   stop(): void {
+    this.lifecycleId += 1;
     if (this.fastTimer) { clearInterval(this.fastTimer); this.fastTimer = null; }
     if (this.slowTimer) { clearInterval(this.slowTimer); this.slowTimer = null; }
+    this.fastPollInFlight = null;
+    this.slowPollInFlight = null;
+    this.clearClientCaches();
   }
 
   getState(): PluginState {
@@ -182,6 +195,7 @@ export class Poller {
       if (
         key === 'searchResults' ||
         key === 'searchLoading' ||
+        key === 'streamThumbnails' ||
         key === 'prowlarrSearchResults' ||
         key === 'prowlarrSearchLoading' ||
         key === 'bazarrSubtitleSearchResults' ||
@@ -195,11 +209,33 @@ export class Poller {
   async refreshFast(): Promise<void> { return this.pollFast(); }
   async refreshAll(): Promise<void> { await Promise.all([this.pollFast(), this.pollSlow()]); }
 
-  private async pollFast(): Promise<void> {
+  private pollFast(): Promise<void> {
+    if (this.fastPollInFlight) return this.fastPollInFlight;
+    const lifecycleId = this.lifecycleId;
+    let poll: Promise<void>;
+    poll = this.runFastPoll(lifecycleId).finally(() => {
+      if (this.fastPollInFlight === poll) this.fastPollInFlight = null;
+    });
+    this.fastPollInFlight = poll;
+    return poll;
+  }
+
+  private pollSlow(): Promise<void> {
+    if (this.slowPollInFlight) return this.slowPollInFlight;
+    const lifecycleId = this.lifecycleId;
+    let poll: Promise<void>;
+    poll = this.runSlowPoll(lifecycleId).finally(() => {
+      if (this.slowPollInFlight === poll) this.slowPollInFlight = null;
+    });
+    this.slowPollInFlight = poll;
+    return poll;
+  }
+
+  private async runFastPoll(lifecycleId: number): Promise<void> {
     const status: Record<string, ServiceStatus> = { ...this.state.serviceStatus };
 
     const [tautulliR, sabR, qbitR, tdarrNodesR, tdarrStagedR, sabStatusR, qbitTransferR] = await Promise.allSettled([
-      this.clients.tautulli    ? this.clients.tautulli.getActivity()   : Promise.resolve(null),
+      this.clients.tautulli    ? this.clients.tautulli.getActivity({ includeThumbnails: false }) : Promise.resolve(null),
       this.clients.sabnzbd     ? this.clients.sabnzbd.getQueue()       : Promise.resolve(null),
       this.clients.qbittorrent ? this.clients.qbittorrent.getTorrents(): Promise.resolve(null),
       this.clients.tdarr       ? this.clients.tdarr.getNodes()          : Promise.resolve(null),
@@ -208,8 +244,13 @@ export class Poller {
       this.clients.qbittorrent ? this.clients.qbittorrent.getTransferInfo() : Promise.resolve(null),
     ]);
 
+    if (lifecycleId !== this.lifecycleId) return;
+
     if (this.clients.tautulli) {
-      if (tautulliR.status === 'fulfilled' && tautulliR.value) { this.state.streams = (tautulliR.value as any).sessions; status.tautulli = 'ok'; }
+      if (tautulliR.status === 'fulfilled' && tautulliR.value) {
+        this.state.streams = (tautulliR.value as any).sessions;
+        status.tautulli = 'ok';
+      }
       else { this.state.streams = []; status.tautulli = 'error'; }
     }
 
@@ -240,7 +281,7 @@ export class Poller {
     this.publish();
   }
 
-  private async pollSlow(): Promise<void> {
+  private async runSlowPoll(lifecycleId: number): Promise<void> {
     const status: Record<string, ServiceStatus> = { ...this.state.serviceStatus };
 
     // Show loading indicator for the library while fetching
@@ -287,6 +328,8 @@ export class Poller {
         this.clients.qbittorrent ? this.clients.qbittorrent.getGlobalStats()     : Promise.resolve(null),
         this.clients.sabnzbd   ? this.clients.sabnzbd.getHistory(20)             : Promise.resolve(null),
       ]);
+
+    if (lifecycleId !== this.lifecycleId) return;
 
     let plexCatalogIndex = buildPlexCatalogIndex([]);
     if (this.clients.plex) {
@@ -471,6 +514,8 @@ export class Poller {
       this.state.sabHistory = sabHistoryR.value as any;
     }
 
+    if (lifecycleId !== this.lifecycleId) return;
+
     this.state.serviceStatus = status;
     this.state.libraryLoading = false;
     this.publish();
@@ -480,6 +525,18 @@ export class Poller {
     const client = (this.clients as Record<string, { ping?: () => Promise<boolean> }>)[service];
     if (!client || typeof client.ping !== 'function') return false;
     return client.ping();
+  }
+
+  private clearClientCaches(): void {
+    this.clients.tautulli?.clearThumbnailCache();
+    this.state.streamThumbnails = {};
+    this.api.state.set('streamThumbnails', {});
+  }
+
+  setStreamThumbnail(thumb: string, dataUrl: string): void {
+    if (this.state.streamThumbnails[thumb] === dataUrl) return;
+    this.state.streamThumbnails = { ...this.state.streamThumbnails, [thumb]: dataUrl };
+    this.api.state.set('streamThumbnails', this.state.streamThumbnails);
   }
 }
 

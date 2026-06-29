@@ -493,6 +493,7 @@ export interface QbitTransferInfo {
 
 export interface PluginState {
   streams: TautulliSession[];
+  streamThumbnails: Record<string, string>;
   downloads: DownloadItem[];
   serviceStatus: Record<string, ServiceStatus>;
   libraryStats: LibraryStat[];
