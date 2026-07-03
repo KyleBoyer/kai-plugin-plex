@@ -14,6 +14,12 @@ export interface PluginAPI {
     set(key: string, value: unknown): void;
     replace(next: Record<string, unknown>): void;
   };
+  /** Automation event bus (host >= 1.0.121); absent on older hosts, so always guard access. */
+  events?: {
+    declare(decl: { events?: EventDescriptor[]; actions?: unknown[] }): void;
+    emit(event: string, payload?: unknown): void;
+    on(key: string, handler: (event: unknown) => void): () => void;
+  };
   ui: {
     registerPanelView(desc: PanelDescriptor): void;
     registerNavigationItem(desc: NavDescriptor): void;
@@ -27,6 +33,13 @@ export interface PluginAPI {
     register(tools: ToolDefinition[]): void;
   };
   fetch: typeof fetch;
+}
+
+export interface EventDescriptor {
+  event: string;
+  title: string;
+  description?: string;
+  payloadSchema?: Record<string, unknown>;
 }
 
 export interface PanelDescriptor {

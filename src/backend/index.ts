@@ -55,6 +55,10 @@ let poller: Poller | null = null;
 let unsubConfig: (() => void) | null = null;
 const streamThumbnailLoads = new Map<string, Promise<void>>();
 
+function sameServiceConfig(a?: ServiceConfig, b?: ServiceConfig): boolean {
+  return a?.url === b?.url && a?.apiKey === b?.apiKey && (a?.enabled ?? true) === (b?.enabled ?? true);
+}
+
 function buildAllClients(api: PluginAPI, config: PluginConfig, fetchFn: typeof fetch): Clients {
   function make<T>(
     svc: ServiceConfig | undefined,
@@ -82,6 +86,75 @@ function buildAllClients(api: PluginAPI, config: PluginConfig, fetchFn: typeof f
   };
 }
 
+function declareAutomationEvents(api: PluginAPI): void {
+  if (!api.events) return;
+  const streamSchema = {
+    type: 'object',
+    properties: {
+      sessionKey: { type: 'string' }, user: { type: 'string' }, title: { type: 'string' },
+      grandparentTitle: { type: 'string' }, mediaType: { type: 'string' }, player: { type: 'string' },
+      state: { type: 'string' }, transcodeDecision: { type: 'string' }, ipAddress: { type: 'string' },
+      progressPercent: { type: 'number' },
+    },
+  };
+  const requestSchema = {
+    type: 'object',
+    properties: {
+      id: { type: 'number' }, type: { type: 'string', enum: ['movie', 'tv'] }, title: { type: 'string' },
+      year: { type: 'number' }, requestedBy: { type: 'string' }, status: { type: 'number' },
+      tmdbId: { type: 'number' }, tvdbId: { type: 'number' }, createdAt: { type: 'string' },
+    },
+  };
+  const downloadSchema = {
+    type: 'object',
+    properties: {
+      id: { type: 'string' }, source: { type: 'string', enum: ['sabnzbd', 'qbittorrent'] },
+      name: { type: 'string' }, status: { type: 'string' }, category: { type: 'string' },
+      sizeBytes: { type: 'number' }, progress: { type: 'number' }, removedFromQueue: { type: 'boolean' },
+    },
+  };
+  const mediaSchema = {
+    type: 'object',
+    properties: {
+      source: { type: 'string', enum: ['radarr', 'sonarr'] }, id: { type: 'number' },
+      type: { type: 'string', enum: ['movie', 'show'] }, title: { type: 'string' }, year: { type: 'number' },
+      status: { type: 'string' }, monitored: { type: 'boolean' }, hasFile: { type: 'boolean' },
+      tmdbId: { type: 'number' }, tvdbId: { type: 'number' },
+    },
+  };
+  try {
+    api.events.declare({
+      events: [
+        { event: 'stream:started', title: 'Stream started', description: 'A Plex playback session began (via Tautulli, ~30s polling)', payloadSchema: streamSchema },
+        { event: 'stream:stopped', title: 'Stream stopped', description: 'A Plex playback session ended', payloadSchema: streamSchema },
+        { event: 'request:submitted', title: 'Media request submitted', description: 'A new Seer/Overseerr request appeared', payloadSchema: requestSchema },
+        { event: 'request:approved', title: 'Media request approved', description: 'A Seer/Overseerr request was approved', payloadSchema: requestSchema },
+        { event: 'request:denied', title: 'Media request denied', description: 'A Seer/Overseerr request was declined', payloadSchema: requestSchema },
+        { event: 'download:added', title: 'Download added', description: 'A new item appeared in the SABnzbd/qBittorrent queue', payloadSchema: downloadSchema },
+        { event: 'download:completed', title: 'Download completed', description: 'A queue item reached 100% or left the queue near completion', payloadSchema: downloadSchema },
+        { event: 'download:removed', title: 'Download removed', description: 'A queue item disappeared well before completion (likely deleted)', payloadSchema: downloadSchema },
+        { event: 'media:added', title: 'Media added to library', description: 'A movie/show was added to Radarr/Sonarr', payloadSchema: mediaSchema },
+        { event: 'media:removed', title: 'Media removed from library', description: 'A movie/show was removed from Radarr/Sonarr', payloadSchema: mediaSchema },
+        { event: 'media:available', title: 'Media available', description: 'A monitored movie/show got its file(s) and is ready to watch', payloadSchema: mediaSchema },
+        {
+          event: 'service:status-changed', title: 'Service status changed',
+          description: 'A configured service went up or down',
+          payloadSchema: {
+            type: 'object',
+            properties: {
+              service: { type: 'string' },
+              from: { type: 'string', enum: ['ok', 'error'] },
+              to: { type: 'string', enum: ['ok', 'error'] },
+            },
+          },
+        },
+      ],
+    });
+  } catch (e) {
+    api.log.warn(`Event declaration failed (host may predate the automation bus): ${e}`);
+  }
+}
+
 export async function activate(api: PluginAPI): Promise<void> {
   api.log.info('Plex plugin activating');
 
@@ -92,10 +165,16 @@ export async function activate(api: PluginAPI): Promise<void> {
   // Encrypt any plaintext keys left in settings (e.g. from pre-populated settings.json)
   migrateKeys(api);
 
+  // Publish this plugin's event catalog for the automations rule editor
+  declareAutomationEvents(api);
+
   const config = api.config.getPluginData() as PluginConfig;
   const allClients = buildAllClients(api, config, api.fetch);
 
-  poller = new Poller(api, allClients);
+  // Give the poller its own snapshot: allClients is mutated in-place on config
+  // change (action handlers close over it), and the poller must be able to
+  // compare old vs new client instances to re-prime its event baselines.
+  poller = new Poller(api, { ...allClients });
 
   // Immediately publish initial status: 'loading' for configured services, 'unconfigured' otherwise
   const serviceNames: (keyof typeof allClients)[] = [
@@ -141,11 +220,23 @@ export async function activate(api: PluginAPI): Promise<void> {
   api.tools.register(buildPlexTools(allClients));
 
   // Watch for config changes
+  let currentConfig = config;
   unsubConfig = api.config.onChanged(() => {
     const updated = api.config.getPluginData() as PluginConfig;
-    const newClients = buildAllClients(api, updated, api.fetch);
-    Object.assign(allClients, newClients);
-    if (poller) poller.updateClients(newClients);
+    const rebuilt = buildAllClients(api, updated, api.fetch);
+    // Keep the existing client instance for services whose config didn't
+    // change: the poller resets a service's event baseline when its client
+    // instance is swapped, and unrelated config edits must not do that.
+    for (const svc of SERVICE_NAMES) {
+      if (sameServiceConfig(currentConfig[svc], updated[svc])) {
+        (rebuilt as Record<string, unknown>)[svc] = (allClients as Record<string, unknown>)[svc];
+      }
+    }
+    currentConfig = updated;
+    // Update the poller before mutating allClients so it can still see the old
+    // client instances when deciding which event baselines to reset.
+    if (poller) poller.updateClients({ ...rebuilt });
+    Object.assign(allClients, rebuilt);
     api.log.info('Plex plugin config updated, clients reinitialized');
   });
 

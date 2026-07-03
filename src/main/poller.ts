@@ -1,4 +1,4 @@
-import type { PluginAPI, PluginState, SearchResult, ServiceStatus } from '../shared/types.js';
+import type { DownloadItem, PluginAPI, PluginState, SearchResult, SeerRequest, ServiceStatus, TautulliSession } from '../shared/types.js';
 import type { PlexClient, PlexLibraryItem } from './clients/plex.js';
 import type { RadarrClient } from './clients/radarr.js';
 import type { SonarrClient } from './clients/sonarr.js';
@@ -88,6 +88,59 @@ function attachPlexLibrarySection(item: SearchResult, index: PlexCatalogIndex): 
   };
 }
 
+function streamEventPayload(s: TautulliSession): Record<string, unknown> {
+  return {
+    sessionKey: s.sessionKey, user: s.user, title: s.title,
+    parentTitle: s.parentTitle, grandparentTitle: s.grandparentTitle,
+    mediaType: s.mediaType, player: s.player, state: s.state,
+    transcodeDecision: s.transcodeDecision, qualityProfile: s.qualityProfile,
+    ipAddress: s.ipAddress, progressPercent: s.progressPercent,
+  };
+}
+
+function requestEventPayload(r: SeerRequest): Record<string, unknown> {
+  return {
+    id: r.id, type: r.type, title: r.title, year: r.year,
+    requestedBy: r.requestedBy, status: r.status,
+    tmdbId: r.tmdbId, tvdbId: r.tvdbId, createdAt: r.createdAt,
+  };
+}
+
+function downloadEventPayload(d: DownloadItem): Record<string, unknown> {
+  return {
+    id: d.id, source: d.source, name: d.name, status: d.status,
+    category: d.category, sizeBytes: d.sizeBytes, progress: d.progress,
+  };
+}
+
+function mediaEventPayload(source: 'radarr' | 'sonarr', item: SearchResult): Record<string, unknown> {
+  return {
+    source, id: source === 'radarr' ? item.radarrId : item.sonarrId,
+    type: item.type, title: item.title, year: item.year, status: item.status,
+    monitored: item.monitored, hasFile: item.hasFile,
+    tmdbId: item.tmdbId, tvdbId: item.tvdbId,
+  };
+}
+
+// Overseerr/Jellyseerr request status codes
+const SEER_STATUS_APPROVED = 2;
+const SEER_STATUS_DECLINED = 3;
+
+// A queue item that disappears at/above this progress is treated as completed
+// (SAB items move to history at 100%, but the last 30s poll may lag slightly);
+// below it, as removed/deleted.
+const DOWNLOAD_COMPLETE_THRESHOLD = 90;
+
+// Both queue fetches are capped at this many items; at the cap, items entering
+// or leaving the snapshot may just be page churn, not real queue changes.
+const DOWNLOAD_PAGE_LIMIT = 50;
+
+// progress is rounded to an integer (a qBit torrent at 99.5% reports 100),
+// so completion also requires no bytes remaining.
+function isDownloadComplete(d: DownloadItem): boolean {
+  return d.progress >= 100 && d.sizeLeftBytes <= 0;
+}
+
 export class Poller {
   private api: PluginAPI;
   private clients: Clients;
@@ -144,16 +197,190 @@ export class Poller {
     wizarrServers: [],
   };
 
+  // Event-diff baselines. `null` means "not yet primed": the first successful
+  // fetch of each domain seeds the baseline without emitting, so an app launch
+  // with active streams/requests doesn't fire a burst of stale events.
+  private prevStreams: Map<string, TautulliSession> | null = null;
+  private prevDownloads: Record<'sabnzbd' | 'qbittorrent', Map<string, DownloadItem> | null> = {
+    sabnzbd: null,
+    qbittorrent: null,
+  };
+  private prevRequests: Map<number, number> | null = null;
+  private maxKnownRequestId = 0;
+  private prevLibrary: Record<'radarr' | 'sonarr', Map<number, { hasFile: boolean; item: SearchResult }> | null> = {
+    radarr: null,
+    sonarr: null,
+  };
+
   constructor(api: PluginAPI, clients: Clients) {
     this.api = api;
     this.clients = clients;
+  }
+
+  private emitEvent(event: string, payload: Record<string, unknown>): void {
+    try {
+      this.api.events?.emit(event, payload);
+    } catch (e) {
+      this.api.log.warn(`Event emit failed (${event}): ${e}`);
+    }
+  }
+
+  private diffStreams(next: TautulliSession[]): void {
+    const nextMap = new Map(next.map(s => [String(s.sessionKey), s]));
+    const prev = this.prevStreams;
+    this.prevStreams = nextMap;
+    if (!prev) return;
+    for (const [key, s] of nextMap) {
+      if (!prev.has(key)) this.emitEvent('stream:started', streamEventPayload(s));
+    }
+    for (const [key, s] of prev) {
+      if (!nextMap.has(key)) this.emitEvent('stream:stopped', streamEventPayload(s));
+    }
+  }
+
+  private diffDownloads(source: 'sabnzbd' | 'qbittorrent', items: DownloadItem[]): void {
+    const nextMap = new Map(items.map(d => [d.id, d]));
+    const prev = this.prevDownloads[source];
+    this.prevDownloads[source] = nextMap;
+    if (!prev) return;
+    // At the fetch cap we can't tell page churn from real adds/removes, so only
+    // emit progress-transition completions (ids present in both snapshots).
+    const paginated = prev.size >= DOWNLOAD_PAGE_LIMIT || nextMap.size >= DOWNLOAD_PAGE_LIMIT;
+    for (const [id, d] of nextMap) {
+      const before = prev.get(id);
+      if (!before) {
+        if (!paginated) {
+          this.emitEvent('download:added', downloadEventPayload(d));
+          // Small items can be added and finish within one poll interval
+          if (isDownloadComplete(d)) this.emitEvent('download:completed', downloadEventPayload(d));
+        }
+      } else if (!isDownloadComplete(before) && isDownloadComplete(d)) {
+        this.emitEvent('download:completed', downloadEventPayload(d));
+      }
+    }
+    if (paginated) return;
+    for (const [id, d] of prev) {
+      if (nextMap.has(id) || isDownloadComplete(d)) continue; // still queued, or completion already emitted
+      if (d.progress >= DOWNLOAD_COMPLETE_THRESHOLD) {
+        this.emitEvent('download:completed', { ...downloadEventPayload(d), removedFromQueue: true });
+      } else {
+        this.emitEvent('download:removed', downloadEventPayload(d));
+      }
+    }
+  }
+
+  private diffRequests(requests: SeerRequest[]): void {
+    const prev = this.prevRequests;
+    const nextStatus = new Map(requests.map(r => [r.id, r.status]));
+    this.prevRequests = nextStatus;
+    // Requests come from a windowed "latest 100" fetch; ids are auto-increment,
+    // so only ids above the previous max are genuinely new submissions (an old
+    // request sliding back into the window must not re-emit "submitted").
+    const maxKnown = this.maxKnownRequestId;
+    for (const id of nextStatus.keys()) {
+      if (id > this.maxKnownRequestId) this.maxKnownRequestId = id;
+    }
+    if (!prev) return;
+    for (const r of requests) {
+      const before = prev.get(r.id);
+      if (before == null) {
+        if (r.id <= maxKnown) continue;
+        this.emitEvent('request:submitted', requestEventPayload(r));
+        // Auto-approval can land before we ever see the request as pending
+        if (r.status === SEER_STATUS_APPROVED) this.emitEvent('request:approved', requestEventPayload(r));
+        if (r.status === SEER_STATUS_DECLINED) this.emitEvent('request:denied', requestEventPayload(r));
+        continue;
+      }
+      if (before === r.status) continue;
+      if (r.status === SEER_STATUS_APPROVED) this.emitEvent('request:approved', requestEventPayload(r));
+      else if (r.status === SEER_STATUS_DECLINED) this.emitEvent('request:denied', requestEventPayload(r));
+    }
+  }
+
+  private diffLibrary(source: 'radarr' | 'sonarr', items: SearchResult[]): void {
+    const nextMap = new Map<number, { hasFile: boolean; item: SearchResult }>();
+    for (const item of items) {
+      const id = source === 'radarr' ? item.radarrId : item.sonarrId;
+      if (id != null) nextMap.set(id, { hasFile: Boolean(item.hasFile), item });
+    }
+    const prev = this.prevLibrary[source];
+    this.prevLibrary[source] = nextMap;
+    if (!prev) return;
+    for (const [id, entry] of nextMap) {
+      const before = prev.get(id);
+      if (!before) {
+        this.emitEvent('media:added', mediaEventPayload(source, entry.item));
+        // Imported with an existing file, or downloaded within one poll interval
+        if (entry.hasFile) this.emitEvent('media:available', mediaEventPayload(source, entry.item));
+      } else if (!before.hasFile && entry.hasFile) {
+        this.emitEvent('media:available', mediaEventPayload(source, entry.item));
+      }
+    }
+    for (const [id, entry] of prev) {
+      if (!nextMap.has(id)) this.emitEvent('media:removed', mediaEventPayload(source, entry.item));
+    }
+  }
+
+  /** Merge freshly-determined statuses (only the services a poll actually checked). */
+  private applyServiceStatus(updates: Record<string, ServiceStatus>): void {
+    const prev = this.state.serviceStatus;
+    for (const [svc, st] of Object.entries(updates)) {
+      const before = prev[svc];
+      // Only up/down transitions are events; initial loading→ok/error is not.
+      if ((before === 'ok' || before === 'error') && (st === 'ok' || st === 'error') && before !== st) {
+        this.emitEvent('service:status-changed', { service: svc, from: before, to: st });
+      }
+    }
+    this.state.serviceStatus = { ...prev, ...updates };
   }
 
   updateClients(clients: Clients): void {
     if (this.clients.tautulli && this.clients.tautulli !== clients.tautulli) {
       this.clients.tautulli.clearThumbnailCache();
     }
+    // A rebuilt client may point at a different server (URL/key change), so its
+    // event baseline is no longer comparable — re-prime instead of diffing
+    // the new server's snapshot against the old one.
+    if (this.clients.tautulli !== clients.tautulli) this.prevStreams = null;
+    if (this.clients.sabnzbd !== clients.sabnzbd) this.prevDownloads.sabnzbd = null;
+    if (this.clients.qbittorrent !== clients.qbittorrent) this.prevDownloads.qbittorrent = null;
+    if (this.clients.seer !== clients.seer) {
+      this.prevRequests = null;
+      this.maxKnownRequestId = 0;
+    }
+    if (this.clients.radarr !== clients.radarr) this.prevLibrary.radarr = null;
+    if (this.clients.sonarr !== clients.sonarr) this.prevLibrary.sonarr = null;
+    // Reset status for swapped services too: the new server's first poll is an
+    // initial check, not an up/down transition of the old one.
+    const status = { ...this.state.serviceStatus };
+    let anySwapped = false;
+    const services = new Set([...Object.keys(this.clients), ...Object.keys(clients)]) as Set<keyof Clients>;
+    for (const svc of services) {
+      if (this.clients[svc] !== clients[svc]) {
+        status[svc] = clients[svc] ? 'loading' : 'unconfigured';
+        anySwapped = true;
+      }
+    }
+    if (anySwapped) {
+      this.state.serviceStatus = status;
+      this.api.state.set('serviceStatus', status);
+      // Discard in-flight polls: a response from an old client landing after
+      // this point would prime the fresh baselines with old-server data.
+      this.lifecycleId += 1;
+      this.fastPollInFlight = null;
+      this.slowPollInFlight = null;
+      // An invalidated slow poll can no longer clear the loading flag itself
+      if (this.state.libraryLoading) {
+        this.state.libraryLoading = false;
+        this.api.state.set('libraryLoading', false);
+      }
+    }
     this.clients = clients;
+    // Poll the swapped clients right away rather than waiting out the interval
+    if (anySwapped && (this.fastTimer || this.slowTimer)) {
+      void this.pollFast().catch(() => undefined);
+      void this.pollSlow().catch(() => undefined);
+    }
   }
 
   initStatus(statuses: Record<string, ServiceStatus>): void {
@@ -162,7 +389,7 @@ export class Poller {
   }
 
   setServiceStatus(service: string, status: ServiceStatus): void {
-    this.state.serviceStatus = { ...this.state.serviceStatus, [service]: status };
+    this.applyServiceStatus({ ...this.state.serviceStatus, [service]: status });
     this.api.state.set('serviceStatus', this.state.serviceStatus);
   }
 
@@ -232,7 +459,8 @@ export class Poller {
   }
 
   private async runFastPoll(lifecycleId: number): Promise<void> {
-    const status: Record<string, ServiceStatus> = { ...this.state.serviceStatus };
+    // Collects only the services this poll checks; merged into serviceStatus at the end
+    const status: Record<string, ServiceStatus> = {};
 
     const [tautulliR, sabR, qbitR, tdarrNodesR, tdarrStagedR, sabStatusR, qbitTransferR] = await Promise.allSettled([
       this.clients.tautulli    ? this.clients.tautulli.getActivity({ includeThumbnails: false }) : Promise.resolve(null),
@@ -249,6 +477,7 @@ export class Poller {
     if (this.clients.tautulli) {
       if (tautulliR.status === 'fulfilled' && tautulliR.value) {
         this.state.streams = (tautulliR.value as any).sessions;
+        this.diffStreams(this.state.streams);
         status.tautulli = 'ok';
       }
       else { this.state.streams = []; status.tautulli = 'error'; }
@@ -256,10 +485,12 @@ export class Poller {
 
     const sabItems = (this.clients.sabnzbd && sabR.status === 'fulfilled' && sabR.value) ? sabR.value as any[] : [];
     if (this.clients.sabnzbd) status.sabnzbd = sabR.status === 'fulfilled' && sabR.value ? 'ok' : 'error';
+    if (this.clients.sabnzbd && sabR.status === 'fulfilled' && sabR.value) this.diffDownloads('sabnzbd', sabItems as DownloadItem[]);
     if (sabStatusR.status === 'fulfilled' && sabStatusR.value) this.state.sabFullStatus = sabStatusR.value as any;
 
     const qbitItems = (this.clients.qbittorrent && qbitR.status === 'fulfilled' && qbitR.value) ? qbitR.value as any[] : [];
     if (this.clients.qbittorrent) status.qbittorrent = qbitR.status === 'fulfilled' && qbitR.value ? 'ok' : 'error';
+    if (this.clients.qbittorrent && qbitR.status === 'fulfilled' && qbitR.value) this.diffDownloads('qbittorrent', qbitItems as DownloadItem[]);
     if (qbitTransferR.status === 'fulfilled' && qbitTransferR.value) this.state.qbitTransferInfo = qbitTransferR.value as any;
 
     if (this.clients.tdarr) {
@@ -276,13 +507,14 @@ export class Poller {
     }
 
     this.state.downloads = [...sabItems, ...qbitItems];
-    this.state.serviceStatus = status;
+    this.applyServiceStatus(status);
     this.state.lastRefresh = Date.now();
     this.publish();
   }
 
   private async runSlowPoll(lifecycleId: number): Promise<void> {
-    const status: Record<string, ServiceStatus> = { ...this.state.serviceStatus };
+    // Collects only the services this poll checks; merged into serviceStatus at the end
+    const status: Record<string, ServiceStatus> = {};
 
     // Show loading indicator for the library while fetching
     this.state.libraryLoading = true;
@@ -345,13 +577,17 @@ export class Poller {
     const libraryItems: SearchResult[] = [];
     if (this.clients.radarr) {
       if (radarrR.status === 'fulfilled' && radarrR.value) {
-        libraryItems.push(...this.clients.radarr.moviesAsSearchResults(radarrR.value as any).map(item => attachPlexLibrarySection(item, plexCatalogIndex)));
+        const radarrItems = this.clients.radarr.moviesAsSearchResults(radarrR.value as any).map(item => attachPlexLibrarySection(item, plexCatalogIndex));
+        libraryItems.push(...radarrItems);
+        this.diffLibrary('radarr', radarrItems);
         status.radarr = 'ok';
       } else { status.radarr = 'error'; }
     }
     if (this.clients.sonarr) {
       if (sonarrR.status === 'fulfilled' && sonarrR.value) {
-        libraryItems.push(...this.clients.sonarr.seriesAsSearchResults(sonarrR.value as any).map(item => attachPlexLibrarySection(item, plexCatalogIndex)));
+        const sonarrItems = this.clients.sonarr.seriesAsSearchResults(sonarrR.value as any).map(item => attachPlexLibrarySection(item, plexCatalogIndex));
+        libraryItems.push(...sonarrItems);
+        this.diffLibrary('sonarr', sonarrItems);
         status.sonarr = 'ok';
       } else { status.sonarr = 'error'; }
     }
@@ -368,6 +604,7 @@ export class Poller {
       } else { status.seer = 'error'; }
       if (seerAllR.status === 'fulfilled' && seerAllR.value) {
         this.state.allRequests = seerAllR.value as any;
+        this.diffRequests(this.state.allRequests);
       }
     }
 
@@ -421,10 +658,11 @@ export class Poller {
     }
 
     if (this.clients.tdarr) {
+      // status.tdarr is owned by the fast poll (getNodes); setting it here too
+      // could flip-flop every cycle if only one of the two endpoints fails.
       if (tdarrR.status === 'fulfilled' && tdarrR.value) {
         this.state.tdarrStatus = (tdarrR.value as any).status;
-        status.tdarr = 'ok';
-      } else { status.tdarr = 'error'; }
+      }
 
       const [resourceR, dbR, librariesR] = await Promise.allSettled([
         this.clients.tdarr.getResourceStats(),
@@ -516,7 +754,7 @@ export class Poller {
 
     if (lifecycleId !== this.lifecycleId) return;
 
-    this.state.serviceStatus = status;
+    this.applyServiceStatus(status);
     this.state.libraryLoading = false;
     this.publish();
   }

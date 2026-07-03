@@ -219,6 +219,171 @@ async function testPollerAttachesPlexLibrarySections() {
   assert.equal(items.find(item => item.id === 'sonarr-1')?.plexLibrarySectionId, '2');
 }
 
+async function testPollerEmitsAutomationEvents() {
+  const { Poller } = await importTs('/Users/kyleboyer/git/kai-plugin-plex/src/main/poller.ts');
+  const events = [];
+  const api = {
+    state: { set() {} },
+    log: { info() {}, warn() {}, error() {} },
+    events: { emit(event, payload) { events.push({ event, payload }); } },
+  };
+
+  const session = (key, title) => ({ sessionKey: key, user: 'kyle', title, mediaType: 'movie', player: 'TV', state: 'playing', progressPercent: 10 });
+  const dl = (id, progress, sizeLeftBytes = 100 - progress) => ({ id, source: 'sabnzbd', name: `job-${id}`, status: 'Downloading', sizeBytes: 100, sizeLeftBytes, speed: 1, eta: '1m', progress });
+
+  let sessions = [session('a', 'Arrival')];
+  let queue = [dl('sab-1', 95), dl('sab-3', 50), dl('sab-4', 10)];
+  let requests = [{ id: 10, type: 'movie', status: 1, title: 'Dune', createdAt: '2026-07-01' }];
+  let movies = [{ id: 'radarr-1', source: 'radarr', type: 'movie', title: 'Dune', year: 2021, status: 'monitored', monitored: true, hasFile: false, radarrId: 1 }];
+  let tautulliDown = false;
+
+  const makeTautulli = () => ({
+    getActivity: async () => {
+      if (tautulliDown) throw new Error('down');
+      return { sessions };
+    },
+    getVersion: async () => '1.0',
+    clearThumbnailCache: () => {},
+  });
+
+  const clients = {
+    tautulli: makeTautulli(),
+    sabnzbd: {
+      getQueue: async () => queue,
+      getFullStatus: async () => ({ status: 'Downloading', paused: false, slots: queue }),
+      getVersion: async () => '1.0',
+      getDiskSpace: async () => [],
+      getHistory: async () => [],
+    },
+    seer: {
+      getRequests: async (_take, _skip, filter) => (filter === 'pending' ? requests.filter(r => r.status === 1) : requests),
+      getVersion: async () => '1.0',
+    },
+    radarr: {
+      getMovies: async () => movies,
+      moviesAsSearchResults: m => m,
+      getQualityProfiles: async () => [],
+      getRootFolders: async () => [],
+      getDiskSpace: async () => [],
+      getVersion: async () => '1.0',
+    },
+  };
+  const poller = new Poller(api, clients);
+
+  // First poll primes all baselines: no events for pre-existing streams/downloads/requests
+  await poller.refreshAll();
+  assert.deepEqual(events, []);
+
+  // Stream a→b, sab-1 leaves queue at 95%, sab-3 hits 100%, sab-4 deleted at 10%,
+  // sab-2 newly queued, request 11 submitted, request 10 approved,
+  // movie 1 gets its file, movie 2 appears already downloaded
+  sessions = [session('b', 'Severance')];
+  queue = [dl('sab-2', 5), dl('sab-3', 100)];
+  requests = [{ id: 11, type: 'tv', status: 1, title: 'Pluribus', createdAt: '2026-07-03' }, { id: 10, type: 'movie', status: 2, title: 'Dune', createdAt: '2026-07-01' }];
+  movies = [
+    { ...movies[0], hasFile: true, status: 'in-library' },
+    { id: 'radarr-2', source: 'radarr', type: 'movie', title: 'Sicario', year: 2015, status: 'in-library', monitored: true, hasFile: true, radarrId: 2 },
+  ];
+  await poller.refreshAll();
+
+  const names = events.map(e => e.event);
+  assert.ok(names.includes('stream:started'), 'stream:started emitted');
+  assert.ok(names.includes('stream:stopped'), 'stream:stopped emitted');
+  assert.equal(events.find(e => e.event === 'stream:started').payload.title, 'Severance');
+  assert.equal(events.find(e => e.event === 'stream:stopped').payload.title, 'Arrival');
+  assert.equal(events.find(e => e.event === 'download:added').payload.id, 'sab-2');
+  const completed = events.filter(e => e.event === 'download:completed');
+  assert.deepEqual(completed.map(e => e.payload.id).sort(), ['sab-1', 'sab-3']);
+  assert.equal(completed.find(e => e.payload.id === 'sab-1').payload.removedFromQueue, true);
+  assert.equal(events.find(e => e.event === 'download:removed').payload.id, 'sab-4');
+  assert.equal(events.find(e => e.event === 'request:submitted').payload.id, 11);
+  assert.equal(events.find(e => e.event === 'request:approved').payload.id, 10);
+  assert.ok(!names.includes('request:denied'));
+  assert.ok(!names.includes('service:status-changed'));
+  assert.equal(events.find(e => e.event === 'media:added').payload.id, 2);
+  const available = events.filter(e => e.event === 'media:available');
+  assert.deepEqual(available.map(e => e.payload.id).sort(), [1, 2]);
+  assert.ok(!names.includes('media:removed'));
+
+  // Tautulli failure: service down event, but no spurious stream:stopped
+  events.length = 0;
+  tautulliDown = true;
+  await poller.refreshFast();
+  assert.deepEqual(events.map(e => e.event), ['service:status-changed']);
+  assert.deepEqual(events[0].payload, { service: 'tautulli', from: 'ok', to: 'error' });
+
+  // Recovery with the stream gone: service up + stream:stopped from retained baseline
+  events.length = 0;
+  tautulliDown = false;
+  sessions = [];
+  await poller.refreshFast();
+  assert.deepEqual(events.map(e => e.event).sort(), ['service:status-changed', 'stream:stopped']);
+  assert.equal(events.find(e => e.event === 'stream:stopped').payload.title, 'Severance');
+
+  // qBit-style rounding: progress shows 100 but bytes remain — not completed yet
+  events.length = 0;
+  queue = [dl('sab-2', 5), dl('sab-5', 100, 3)];
+  await poller.refreshFast();
+  assert.equal(events.find(e => e.event === 'download:added')?.payload.id, 'sab-5');
+  assert.ok(!events.some(e => e.event === 'download:completed'), 'no completion while bytes remain');
+
+  events.length = 0;
+  queue = [dl('sab-2', 5), dl('sab-5', 100, 0)];
+  await poller.refreshFast();
+  assert.deepEqual(events.map(e => e.event), ['download:completed']);
+  assert.equal(events[0].payload.id, 'sab-5');
+
+  // An item that appears already finished (added + completed within one poll
+  // interval) still gets a completion event
+  events.length = 0;
+  queue = [dl('sab-2', 5), dl('sab-5', 100, 0), dl('sab-6', 100, 0)];
+  await poller.refreshFast();
+  assert.deepEqual(events.map(e => e.event), ['download:added', 'download:completed']);
+  assert.equal(events[1].payload.id, 'sab-6');
+
+  // Reconfigured client (new instance) re-primes the baseline and resets the
+  // service status: neither stream diffs nor an ok→error transition of the
+  // old server may fire against the new one
+  events.length = 0;
+  sessions = [session('c', 'Andor')];
+  tautulliDown = true;
+  poller.updateClients({ ...clients, tautulli: makeTautulli() });
+  await poller.refreshFast();
+  assert.deepEqual(events, [], 'no events on first poll of swapped client');
+  tautulliDown = false;
+  await poller.refreshFast();
+  assert.ok(!events.some(e => e.event.startsWith('stream:')), 'no stream events after client swap');
+  assert.deepEqual(events.map(e => e.event), ['service:status-changed']); // genuine error→ok recovery
+
+  // At the 50-item fetch cap, disappearance/addition diffing is suppressed
+  events.length = 0;
+  queue = Array.from({ length: 50 }, (_, i) => dl(`sab-bulk-${i}`, 10));
+  await poller.refreshFast();
+  await poller.refreshFast();
+  queue = Array.from({ length: 50 }, (_, i) => dl(`sab-bulk-${i + 10}`, 10));
+  await poller.refreshFast();
+  assert.ok(!events.some(e => e.event.startsWith('download:')), 'no download events from page churn');
+
+  // An in-flight poll of an old client resolving after a swap must not prime
+  // the new client's baseline with old-server data
+  events.length = 0;
+  const gate = deferred();
+  const slowTautulli = {
+    getActivity: () => gate.promise.then(() => ({ sessions: [session('x', 'Old Server')] })),
+    getVersion: async () => '1.0',
+    clearThumbnailCache: () => {},
+  };
+  poller.updateClients({ ...clients, tautulli: slowTautulli });
+  const inflight = poller.refreshFast();
+  poller.updateClients({ ...clients, tautulli: makeTautulli() });
+  gate.resolve();
+  await inflight;
+  sessions = [session('y', 'New Server')];
+  await poller.refreshFast();
+  await poller.refreshFast();
+  assert.deepEqual(events.filter(e => e.event.startsWith('stream:')), [], 'stale in-flight poll must not prime or diff');
+}
+
 async function testPollerDoesNotOverlapFastPolls() {
   const { Poller } = await importTs('/Users/kyleboyer/git/kai-plugin-plex/src/main/poller.ts');
   const gate = deferred();
@@ -418,6 +583,7 @@ await testSeerTvUsesTmdb();
 await testTautulliNoApiKeyUrl();
 await testPlexLibraryIndexExtractsSectionIds();
 await testPollerAttachesPlexLibrarySections();
+await testPollerEmitsAutomationEvents();
 await testPollerDoesNotOverlapFastPolls();
 await testPollerPublishesStreamThumbnailsSeparately();
 await testBackendRejectsAmbiguousAddDefaults();
