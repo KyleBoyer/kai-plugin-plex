@@ -470,7 +470,7 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
 
     {
       name: 'plex_move_media',
-      description: 'Change an existing Radarr movie or Sonarr series root folder and/or quality profile, optionally moving files. IMPORTANT: Always confirm exact title, target folder/profile, and moveFiles before calling.',
+      description: 'Change an existing Radarr movie or Sonarr series root folder and/or quality profile, optionally moving files.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -537,7 +537,7 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
 
     {
       name: 'plex_remove_media',
-      description: 'Remove a movie from Radarr or show from Sonarr. IMPORTANT: Destructive; always confirm title, id, and deleteFiles before calling.',
+      description: 'Remove a movie from Radarr or show from Sonarr.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -737,7 +737,7 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
 
     {
       name: 'plex_control_downloads',
-      description: 'Pause/resume SABnzbd or qBittorrent globally, or set qBittorrent transfer limits. IMPORTANT: Always confirm before changing global download state.',
+      description: 'Pause/resume SABnzbd or qBittorrent globally, or set qBittorrent transfer limits.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -879,7 +879,7 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
 
     {
       name: 'plex_add_movie',
-      description: 'Add a movie to Radarr for download. IMPORTANT: Always confirm with the user before calling this tool. Ask them to confirm the title, year, and that they want to add it.',
+      description: 'Add a movie to Radarr for download.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -918,7 +918,7 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
 
     {
       name: 'plex_add_show',
-      description: 'Add a TV show to Sonarr for download. IMPORTANT: Always confirm with the user before calling this tool. Ask them to confirm the title, year, and that they want to add it.',
+      description: 'Add a TV show to Sonarr for download.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -959,7 +959,7 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
 
     {
       name: 'plex_request_media',
-      description: 'Submit a media request via Seer (Overseerr). IMPORTANT: Always confirm with the user before calling this tool.',
+      description: 'Submit a media request via Seer (Overseerr).',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1063,7 +1063,7 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
 
     {
       name: 'plex_bazarr_search_subtitles',
-      description: 'Search Bazarr providers for subtitles for one Radarr movie or Sonarr episode. This only searches; downloading requires a separate confirmed tool call.',
+      description: 'Search Bazarr providers for subtitles for one Radarr movie or Sonarr episode. This only searches; use the subtitle download tool to download a result.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1118,7 +1118,7 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
 
     {
       name: 'plex_bazarr_download_subtitle',
-      description: 'Download a subtitle through Bazarr. IMPORTANT: Always confirm the exact title/item, language, provider, and subtitle before calling this tool.',
+      description: 'Download a subtitle through Bazarr.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1166,7 +1166,7 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
 
     {
       name: 'plex_bazarr_run_task',
-      description: 'Run a Bazarr maintenance task. IMPORTANT: Always confirm the exact task name/id before calling this tool.',
+      description: 'Run a Bazarr maintenance task.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1187,7 +1187,7 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
 
     {
       name: 'plex_prowlarr_search_releases',
-      description: 'Search Prowlarr indexers for releases. Returns release objects that can be passed to plex_prowlarr_grab_release after user confirmation.',
+      description: 'Search Prowlarr indexers for releases. Returns release objects that can be passed to plex_prowlarr_grab_release.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1248,7 +1248,7 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
 
     {
       name: 'plex_prowlarr_grab_release',
-      description: 'Grab a Prowlarr release and send it to the configured download client. IMPORTANT: Always confirm the exact release title, indexer, size, and target download client before calling this tool.',
+      description: 'Grab a Prowlarr release and send it to the configured download client.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1350,7 +1350,7 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
 
     {
       name: 'plex_tdarr_control_node',
-      description: 'Pause, resume, restart, or disconnect a Tdarr node. IMPORTANT: Always confirm the exact node name/id and action before calling this tool.',
+      description: 'Pause, resume, restart, or disconnect a Tdarr node.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1378,7 +1378,7 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
 
     {
       name: 'plex_tdarr_control_worker',
-      description: 'Change Tdarr worker limits, cancel a worker item, or kill a worker. IMPORTANT: Always confirm node id, worker type/id, and the action before calling this tool.',
+      description: 'Change Tdarr worker limits, cancel a worker item, or kill a worker.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1413,7 +1413,7 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
 
     {
       name: 'plex_manage_request',
-      description: 'Approve or deny a pending Seer/Overseerr media request by id. IMPORTANT: Always confirm the request id and action before calling.',
+      description: 'Approve or deny a pending Seer/Overseerr media request by id.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1438,7 +1438,7 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
 
     {
       name: 'plex_control_download_item',
-      description: 'Pause, resume, or delete a single SABnzbd/qBittorrent download item by id/hash. IMPORTANT: Confirm before delete, especially deleteFiles.',
+      description: 'Pause, resume, or delete a single SABnzbd/qBittorrent download item by id/hash.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1479,7 +1479,7 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
 
     {
       name: 'plex_terminate_stream',
-      description: 'Terminate an active Plex stream through Tautulli by session key. IMPORTANT: Always confirm the user/session and optional message before calling.',
+      description: 'Terminate an active Plex stream through Tautulli by session key.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1501,7 +1501,7 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
 
     {
       name: 'plex_bazarr_download_missing',
-      description: 'Download missing/wanted subtitles for one Bazarr movie or episode. IMPORTANT: Confirm item, language, forced, and hearing-impaired flags before calling.',
+      description: 'Download missing/wanted subtitles for one Bazarr movie or episode.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1543,7 +1543,7 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
 
     {
       name: 'plex_bazarr_manage_subtitle',
-      description: 'Delete a Bazarr subtitle, apply a Bazarr subtitle tool, or reset Bazarr providers. IMPORTANT: Confirm exact subtitle/path/action before destructive operations.',
+      description: 'Delete a Bazarr subtitle, apply a Bazarr subtitle tool, or reset Bazarr providers.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1619,7 +1619,7 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
 
     {
       name: 'plex_prowlarr_bulk_grab',
-      description: 'Grab multiple Prowlarr releases and send them to the configured download client. IMPORTANT: Confirm exact release titles, indexers, sizes, and target client before calling.',
+      description: 'Grab multiple Prowlarr releases and send them to the configured download client.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1642,7 +1642,7 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
 
     {
       name: 'plex_tdarr_scan',
-      description: 'Trigger a Tdarr scan for an individual file, rescan a known file record, or scan a library/config. IMPORTANT: Confirm target file/library before calling.',
+      description: 'Trigger a Tdarr scan for an individual file, rescan a known file record, or scan a library/config.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1700,7 +1700,7 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
 
     {
       name: 'plex_wizarr_manage',
-      description: 'Delete a Wizarr invitation or remove a Wizarr user by id. IMPORTANT: Confirm the exact id and action before calling.',
+      description: 'Delete a Wizarr invitation or remove a Wizarr user by id.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1872,7 +1872,7 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
 
     {
       name: 'plex_tdarr_requeue_library',
-      description: 'Requeue all transcode or health-check jobs for a Tdarr library. IMPORTANT: Always confirm the exact library and queue type before calling this tool.',
+      description: 'Requeue all transcode or health-check jobs for a Tdarr library.',
       inputSchema: {
         type: 'object',
         properties: {
