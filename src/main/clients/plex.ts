@@ -110,6 +110,7 @@ export class PlexClient {
           tvdbId: ids.tvdbId,
           imdbId: ids.imdbId,
           ratingKey: item.ratingKey,
+          contentRating: item.contentRating || undefined,
         });
       }
     }
@@ -199,6 +200,7 @@ interface PlexMetadata {
   originallyAvailableAt?: string;
   guid?: string;
   Guid?: { id: string }[];
+  contentRating?: string;
 }
 
 export interface PlexLibraryItem {
@@ -211,4 +213,5 @@ export interface PlexLibraryItem {
   tvdbId?: number;
   imdbId?: string;
   ratingKey?: string;
+  contentRating?: string;
 }

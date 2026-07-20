@@ -543,6 +543,80 @@ async function testListLibraryFiltersAndPages() {
   assert.equal(result.limit, 1);
 }
 
+async function testListLibraryRatingOperatorAndPlexSectionCrossReference() {
+  const { buildPlexTools } = await importTs('/Users/kyleboyer/git/kai-plugin-plex/src/main/tools.ts');
+  const tools = buildPlexTools({
+    radarr: {
+      getQualityProfiles: async () => [],
+      getMovies: async () => [
+        { id: 1, title: 'Paddington', year: 2014, tmdbId: 116149, monitored: true, hasFile: true, status: 'released', rootFolderPath: '/media/kids/movies', certification: 'PG' },
+        { id: 2, title: 'Heat', year: 1995, tmdbId: 949, monitored: true, hasFile: true, status: 'released', rootFolderPath: '/media/kids/movies', certification: 'R' },
+      ],
+    },
+    sonarr: {
+      getQualityProfiles: async () => [],
+      getSeries: async () => [
+        { id: 3, title: 'Bluey', year: 2018, tvdbId: 353546, monitored: true, status: 'continuing', episodeCount: 100, episodeFileCount: 100, rootFolderPath: '/media/tv', certification: 'TV-Y' },
+        { id: 4, title: 'Severance', year: 2022, tvdbId: 371980, monitored: true, status: 'continuing', episodeCount: 19, episodeFileCount: 19, rootFolderPath: '/media/tv', certification: 'TV-MA' },
+        { id: 5, title: 'Daniel Tiger', year: 2012, tvdbId: 222, monitored: true, status: 'continuing', episodeCount: 50, episodeFileCount: 50, rootFolderPath: '/media/kids/tv', certification: 'TV-Y7' },
+      ],
+    },
+    plex: {
+      getLibraryMedia: async () => [
+        { sectionId: '1', sectionName: 'Kids Movies', type: 'movie', title: 'Paddington', year: 2014, tmdbId: 116149 },
+        { sectionId: '1', sectionName: 'Kids Movies', type: 'movie', title: 'Heat', year: 1995, tmdbId: 949 },
+        { sectionId: '2', sectionName: 'TV Shows', type: 'show', title: 'Bluey', year: 2018, tvdbId: 353546 },
+        { sectionId: '2', sectionName: 'TV Shows', type: 'show', title: 'Severance', year: 2022, tvdbId: 371980 },
+        { sectionId: '3', sectionName: 'Kids TV', type: 'show', title: 'Daniel Tiger', year: 2012, tvdbId: 222 },
+      ],
+    },
+  });
+  const listLibrary = tools.find(tool => tool.name === 'plex_list_library');
+
+  // Adult-rated movie sitting in the kids library.
+  const adultInKids = await listLibrary.execute({
+    mediaType: 'movie',
+    plexLibrarySectionName: 'Kids Movies',
+    ratingOperator: 'gt',
+    ratingValue: 'PG',
+  });
+  assert.equal(adultInKids.movieTotal, 1);
+  assert.equal(adultInKids.movies[0].title, 'Heat');
+  assert.equal(adultInKids.movies[0].plexLibrarySectionName, 'Kids Movies');
+
+  // Kids-rated shows (TV-Y7 or below) that live outside the Kids TV library.
+  const kidsOutsideKids = await listLibrary.execute({
+    mediaType: 'show',
+    excludePlexLibrarySectionName: 'Kids TV',
+    ratingOperator: 'lte',
+    ratingValue: 'TV-Y7',
+  });
+  assert.equal(kidsOutsideKids.seriesTotal, 1);
+  assert.equal(kidsOutsideKids.series[0].title, 'Bluey');
+  assert.equal(kidsOutsideKids.series[0].plexLibrarySectionName, 'TV Shows');
+}
+
+async function testListLibraryMediaFiltersBySectionAndRating() {
+  const { buildPlexTools } = await importTs('/Users/kyleboyer/git/kai-plugin-plex/src/main/tools.ts');
+  const tools = buildPlexTools({
+    plex: {
+      getLibraryMedia: async () => [
+        { sectionId: '1', sectionName: 'Kids Movies', type: 'movie', title: 'Paddington', year: 2014, contentRating: 'PG' },
+        { sectionId: '1', sectionName: 'Kids Movies', type: 'movie', title: 'Heat', year: 1995, contentRating: 'R' },
+        { sectionId: '2', sectionName: 'Movies', type: 'movie', title: 'Dune', year: 2021, contentRating: 'PG-13' },
+      ],
+    },
+  });
+  const listLibraryMedia = tools.find(tool => tool.name === 'plex_list_library_media');
+
+  const allInSection = await listLibraryMedia.execute({ sectionName: 'Kids Movies' });
+  assert.equal(allInSection.total, 2);
+
+  const mismatched = await listLibraryMedia.execute({ sectionName: 'Kids Movies', ratingOperator: 'gt', ratingValue: 'PG' });
+  assert.equal(mismatched.total, 1);
+  assert.equal(mismatched.media[0].title, 'Heat');
+}
+
 async function testGetDownloadsFiltersAndTrimsStatus() {
   const { buildPlexTools } = await importTs('/Users/kyleboyer/git/kai-plugin-plex/src/main/tools.ts');
   const tools = buildPlexTools({
@@ -588,6 +662,8 @@ await testPollerDoesNotOverlapFastPolls();
 await testPollerPublishesStreamThumbnailsSeparately();
 await testBackendRejectsAmbiguousAddDefaults();
 await testListLibraryFiltersAndPages();
+await testListLibraryRatingOperatorAndPlexSectionCrossReference();
+await testListLibraryMediaFiltersBySectionAndRating();
 await testGetDownloadsFiltersAndTrimsStatus();
 
 console.log('All tests passed');
