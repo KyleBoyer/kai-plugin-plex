@@ -1,7 +1,7 @@
 {
   "name": "plex",
   "displayName": "Plex & the Arr Stack",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "Dashboard and AI controls for Plex and the arr stack",
   "author": "Kyle Boyer",
   "icon": {
