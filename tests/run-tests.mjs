@@ -612,9 +612,136 @@ async function testListLibraryMediaFiltersBySectionAndRating() {
   const allInSection = await listLibraryMedia.execute({ sectionName: 'Kids Movies' });
   assert.equal(allInSection.total, 2);
 
-  const mismatched = await listLibraryMedia.execute({ sectionName: 'Kids Movies', ratingOperator: 'gt', ratingValue: 'PG' });
+  // mediaType must be scoped to 'movie' (or use movieRatingValue) since a bare "PG" isn't a
+  // valid TV rating and mediaType defaults to 'all' — see rating validation tests below.
+  const mismatched = await listLibraryMedia.execute({ sectionName: 'Kids Movies', mediaType: 'movie', ratingOperator: 'gt', ratingValue: 'PG' });
   assert.equal(mismatched.total, 1);
   assert.equal(mismatched.media[0].title, 'Heat');
+}
+
+async function testListLibraryContentRatingToleratesFormatting() {
+  const { buildPlexTools } = await importTs('/Users/kyleboyer/git/kai-plugin-plex/src/main/tools.ts');
+  const tools = buildPlexTools({
+    radarr: {
+      getQualityProfiles: async () => [],
+      getMovies: async () => [{ id: 1, title: 'Dune', year: 2021, tmdbId: 1, monitored: true, hasFile: true, status: 'released', certification: 'PG-13' }],
+    },
+  });
+  const listLibrary = tools.find(tool => tool.name === 'plex_list_library');
+
+  // "PG13" (no dash) must still match a stored "PG-13" rating.
+  const result = await listLibrary.execute({ mediaType: 'movie', contentRating: 'PG13' });
+  assert.equal(result.movies.length, 1);
+  assert.equal(result.movies[0].title, 'Dune');
+}
+
+async function testListLibraryRatingValidationRejectsInvalidInput() {
+  const { buildPlexTools } = await importTs('/Users/kyleboyer/git/kai-plugin-plex/src/main/tools.ts');
+  const tools = buildPlexTools({
+    radarr: {
+      getQualityProfiles: async () => [],
+      getMovies: async () => [
+        { id: 1, title: 'Heat', year: 1995, tmdbId: 949, monitored: true, hasFile: true, status: 'released', certification: 'R' },
+        { id: 2, title: 'Paddington', year: 2014, tmdbId: 116149, monitored: true, hasFile: true, status: 'released', certification: 'PG' },
+      ],
+    },
+    sonarr: { getQualityProfiles: async () => [], getSeries: async () => [{ id: 3, title: 'Bluey', year: 2018, tvdbId: 1, monitored: true, status: 'continuing', episodeCount: 1, episodeFileCount: 1, certification: 'TV-Y' }] },
+  });
+  const listLibrary = tools.find(tool => tool.name === 'plex_list_library');
+
+  // Garbage operator: hard error, not a silent "matches everything".
+  const badOperator = await listLibrary.execute({ ratingOperator: 'greater-than', ratingValue: 'PG' });
+  assert.match(badOperator.error, /Unrecognized ratingOperator/);
+
+  // Explicitly scoped (mediaType: 'movie') invalid value: hard error, not a silent empty result.
+  const badExplicitValue = await listLibrary.execute({ mediaType: 'movie', ratingOperator: 'lte', ratingValue: 'TV-7' });
+  assert.match(badExplicitValue.moviesError, /not a recognized movie rating/);
+
+  // Shared ratingValue under the default mediaType 'all': "PG-13" is a valid movie rating but
+  // not a valid TV rating (no code is ever valid on both ladders), so the show branch errors
+  // out (plex_list_library:seriesError) while the independently-validated movie branch still
+  // returns correctly filtered results (R excluded, PG kept) — no silent leakage either way.
+  const sharedValue = await listLibrary.execute({ ratingOperator: 'lte', ratingValue: 'PG-13' });
+  assert.equal(sharedValue.movies.length, 1);
+  assert.equal(sharedValue.movies[0].title, 'Paddington');
+  assert.match(sharedValue.seriesError, /not a recognized TV rating/);
+  assert.equal(sharedValue.series, undefined);
+}
+
+async function testPlexSectionFiltersRejectUnknownSectionNames() {
+  const { buildPlexTools } = await importTs('/Users/kyleboyer/git/kai-plugin-plex/src/main/tools.ts');
+  const tools = buildPlexTools({
+    radarr: { getQualityProfiles: async () => [], getMovies: async () => [{ id: 1, title: 'Heat', year: 1995, tmdbId: 949, monitored: true, hasFile: true, status: 'released' }] },
+    plex: {
+      getLibraries: async () => [{ id: '1', name: 'Kids Movies', type: 'movie', count: 1 }],
+      getLibraryMedia: async () => [{ sectionId: '1', sectionName: 'Kids Movies', type: 'movie', title: 'Heat', year: 1995, tmdbId: 949 }],
+    },
+  });
+  const listLibrary = tools.find(tool => tool.name === 'plex_list_library');
+  const listLibraryMedia = tools.find(tool => tool.name === 'plex_list_library_media');
+
+  // Typo'd section name: fails loudly with the real section names, instead of silently
+  // matching zero items.
+  const typo = await listLibrary.execute({ mediaType: 'movie', plexLibrarySectionName: 'Kidz Movies' });
+  assert.match(typo.error, /No configured Plex library section matches/);
+  assert.match(typo.error, /Kids Movies/);
+
+  // Correct name: works normally.
+  const correct = await listLibrary.execute({ mediaType: 'movie', plexLibrarySectionName: 'Kids Movies' });
+  assert.equal(correct.movies.length, 1);
+
+  // Same validation applies to plex_list_library_media's sectionName filter.
+  const mediaTypo = await listLibraryMedia.execute({ sectionName: 'Kidz Movies' });
+  assert.match(mediaTypo.error, /No configured Plex library section matches/);
+}
+
+async function testListLibrarySingleCallKidsRatingAcrossRootFolders() {
+  const { buildPlexTools } = await importTs('/Users/kyleboyer/git/kai-plugin-plex/src/main/tools.ts');
+  const tools = buildPlexTools({
+    radarr: {
+      getQualityProfiles: async () => [],
+      getMovies: async () => [
+        { id: 1, title: 'Paddington', year: 2014, tmdbId: 1, monitored: true, hasFile: true, status: 'released', rootFolderPath: '/Plex/Plex/Kids/Movies', certification: 'PG' },
+        { id: 2, title: 'Encanto', year: 2021, tmdbId: 2, monitored: true, hasFile: true, status: 'released', rootFolderPath: '/Plex/Plex/Movies', certification: 'PG' },
+        { id: 3, title: 'Heat', year: 1995, tmdbId: 3, monitored: true, hasFile: true, status: 'released', rootFolderPath: '/Plex/Plex/Movies', certification: 'R' },
+      ],
+    },
+    sonarr: {
+      getQualityProfiles: async () => [],
+      getSeries: async () => [
+        { id: 4, title: 'Daniel Tiger', year: 2012, tvdbId: 1, monitored: true, status: 'continuing', episodeCount: 1, episodeFileCount: 1, rootFolderPath: '/Plex/Plex/Kids/TV Shows', certification: 'TV-Y7' },
+        { id: 5, title: 'Bluey', year: 2018, tvdbId: 2, monitored: true, status: 'continuing', episodeCount: 1, episodeFileCount: 1, rootFolderPath: '/Plex/Plex/TV Shows', certification: 'TV-Y' },
+        { id: 6, title: 'Severance', year: 2022, tvdbId: 3, monitored: true, status: 'continuing', episodeCount: 1, episodeFileCount: 1, rootFolderPath: '/Plex/Plex/TV Shows', certification: 'TV-MA' },
+      ],
+    },
+  });
+  const listLibrary = tools.find(tool => tool.name === 'plex_list_library');
+
+  // The exact scenario from the transcript: kid-safe titles (movies PG-13 or below, shows
+  // TV-Y7 or below) whose root folder does NOT contain "/Kids/", in one call.
+  const result = await listLibrary.execute({
+    mediaType: 'all',
+    ratingOperator: 'lte',
+    movieRatingValue: 'PG-13',
+    showRatingValue: 'TV-Y7',
+    excludeRootFolderPath: '/Kids/',
+  });
+  assert.deepEqual(result.movies.map(m => m.title), ['Encanto']);
+  assert.deepEqual(result.series.map(s => s.title), ['Bluey']);
+}
+
+async function testListLibrarySectionsAliasesLibraryStats() {
+  const { buildPlexTools } = await importTs('/Users/kyleboyer/git/kai-plugin-plex/src/main/tools.ts');
+  const tools = buildPlexTools({
+    plex: { getLibraryCounts: async () => [{ id: '1', name: 'Kids Movies', type: 'movie', count: 5 }] },
+  });
+  const stats = tools.find(tool => tool.name === 'plex_get_library_stats');
+  const sections = tools.find(tool => tool.name === 'plex_list_library_sections');
+
+  const statsResult = await stats.execute({});
+  const sectionsResult = await sections.execute({});
+  assert.deepEqual(statsResult, sectionsResult);
+  assert.equal(sectionsResult.libraries[0].name, 'Kids Movies');
 }
 
 async function testGetDownloadsFiltersAndTrimsStatus() {
@@ -664,6 +791,11 @@ await testBackendRejectsAmbiguousAddDefaults();
 await testListLibraryFiltersAndPages();
 await testListLibraryRatingOperatorAndPlexSectionCrossReference();
 await testListLibraryMediaFiltersBySectionAndRating();
+await testListLibraryContentRatingToleratesFormatting();
+await testListLibraryRatingValidationRejectsInvalidInput();
+await testPlexSectionFiltersRejectUnknownSectionNames();
+await testListLibrarySingleCallKidsRatingAcrossRootFolders();
+await testListLibrarySectionsAliasesLibraryStats();
 await testGetDownloadsFiltersAndTrimsStatus();
 
 console.log('All tests passed');

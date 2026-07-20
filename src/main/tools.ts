@@ -148,19 +148,53 @@ function filterRecords<T extends AnyRecord>(
 const MOVIE_RATING_ORDER = ['G', 'PG', 'PG-13', 'R', 'NC-17'];
 const TV_RATING_ORDER = ['TV-Y', 'TV-Y7', 'TV-Y7-FV', 'TV-G', 'TV-PG', 'TV-14', 'TV-MA'];
 
-function normalizeRating(value: unknown): string {
-  return String(value ?? '').trim().toUpperCase();
+// Ratings are compared with dashes/spaces stripped so common formatting variants
+// (e.g. "PG13", "PG 13", "PG-13") all resolve to the same ladder position.
+function normalizeRatingKey(value: unknown): string {
+  return String(value ?? '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
 }
 
+const MOVIE_RATING_RANK = new Map(MOVIE_RATING_ORDER.map((rating, idx) => [normalizeRatingKey(rating), idx]));
+const TV_RATING_RANK = new Map(TV_RATING_ORDER.map((rating, idx) => [normalizeRatingKey(rating), idx]));
+
 function ratingRank(rating: unknown, mediaType: 'movie' | 'show'): number | undefined {
+  const ranks = mediaType === 'show' ? TV_RATING_RANK : MOVIE_RATING_RANK;
+  return ranks.get(normalizeRatingKey(rating));
+}
+
+// Loose contentRating matching: substring match (so "PG" matches "PG-13") OR'd with a
+// dash/space/case-insensitive exact match (so "PG13" still matches "PG-13").
+function matchesContentRatingFilters(rating: unknown, filters: string[]): boolean {
+  if (!filters.length) return true;
+  const normalizedRating = normalizeRatingKey(rating);
+  return filters.some(filter => includesText(rating, filter.toLowerCase()) || normalizedRating === normalizeRatingKey(filter));
+}
+
+const RATING_OPERATORS = ['eq', 'ne', 'lt', 'lte', 'gt', 'gte'];
+
+// ratingOperator/ratingValue mistakes must fail loudly. Silently matching everything (an
+// unrecognized operator) or matching nothing (a rating that isn't on the relevant ladder,
+// e.g. a TV code used for a movie comparison) both look like a valid empty/full result to
+// the caller, which is exactly the confusing failure mode this validation exists to avoid.
+function validateRatingOperator(operator: string): string | undefined {
+  if (!operator) return undefined;
+  if (!RATING_OPERATORS.includes(operator)) {
+    return `Unrecognized ratingOperator "${operator}". Use one of: ${RATING_OPERATORS.join(', ')}.`;
+  }
+  return undefined;
+}
+
+function validateRatingValue(operator: string, value: string, mediaType: 'movie' | 'show'): string | undefined {
+  if (!operator || operator === 'eq' || operator === 'ne' || !value) return undefined;
+  if (ratingRank(value, mediaType) != null) return undefined;
   const order = mediaType === 'show' ? TV_RATING_ORDER : MOVIE_RATING_ORDER;
-  const idx = order.indexOf(normalizeRating(rating));
-  return idx === -1 ? undefined : idx;
+  const label = mediaType === 'show' ? 'TV' : 'movie';
+  return `"${value}" is not a recognized ${label} rating for a ${operator} comparison. Valid ${label} ratings: ${order.join(', ')}.`;
 }
 
 function matchesRatingOperator(rating: unknown, mediaType: 'movie' | 'show', operator: string, value: string): boolean {
-  const normalizedRating = normalizeRating(rating);
-  const normalizedValue = normalizeRating(value);
+  const normalizedRating = normalizeRatingKey(rating);
+  const normalizedValue = normalizeRatingKey(value);
   if (operator === 'eq') return normalizedRating === normalizedValue;
   if (operator === 'ne') return normalizedRating !== normalizedValue;
   const ratingIdx = ratingRank(rating, mediaType);
@@ -171,7 +205,7 @@ function matchesRatingOperator(rating: unknown, mediaType: 'movie' | 'show', ope
     case 'lte': return ratingIdx <= valueIdx;
     case 'gt': return ratingIdx > valueIdx;
     case 'gte': return ratingIdx >= valueIdx;
-    default: return true;
+    default: return false;
   }
 }
 
@@ -256,6 +290,51 @@ function sortRecords<T extends AnyRecord>(items: T[], sortBy: string, direction:
 }
 
 export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
+  async function listLibrarySections(input: AnyRecord): Promise<unknown> {
+    if (!clients.plex) return { error: 'Plex not configured' };
+    try {
+      const query = stringParam(input.query).toLowerCase();
+      const mediaTypes = stringFilters(input.mediaType, input.mediaTypes, input.type);
+      const { limit, offset } = getPaging(input, 50, 100);
+      const libs = await clients.plex.getLibraryCounts();
+      const filtered = filterRecords(libs as unknown as AnyRecord[], {
+        query,
+        queryKeys: ['id', 'name', 'type'],
+        stringFilters: [{ keys: ['type'], filters: mediaTypes }],
+      });
+      const paged = pageItems(filtered, limit, offset);
+      return { ...pageMeta(filtered.length, paged.length, limit, offset), libraries: paged };
+    } catch (e) {
+      return { error: String(e) };
+    }
+  }
+
+  // Section name/id filters are free-text against a dynamic, per-server list — unlike
+  // ratings there's no fixed enum to check client-side, so a typo (e.g. "Kidz Movies")
+  // would otherwise silently match zero items with no explanation. Validate against the
+  // real configured sections and fail loudly, listing what's actually available.
+  async function validatePlexSectionFilters(names: string[], ids: string[], excludeNames: string[]): Promise<string | undefined> {
+    if (!names.length && !ids.length && !excludeNames.length) return undefined;
+    if (!clients.plex) return undefined;
+    let sections: { id: string; name: string }[];
+    try {
+      sections = await clients.plex.getLibraries();
+    } catch {
+      return undefined; // best effort; the caller's own Plex fetch will surface the real error
+    }
+    const unknownNames = names.filter(n => !sections.some(s => includesText(s.name, n.toLowerCase())));
+    const unknownExcludeNames = excludeNames.filter(n => !sections.some(s => includesText(s.name, n.toLowerCase())));
+    const unknownIds = ids.filter(id => !sections.some(s => String(s.id) === id));
+    if (!unknownNames.length && !unknownExcludeNames.length && !unknownIds.length) return undefined;
+    const problems = [
+      unknownNames.length ? `section name(s) ${JSON.stringify(unknownNames)}` : '',
+      unknownExcludeNames.length ? `exclude section name(s) ${JSON.stringify(unknownExcludeNames)}` : '',
+      unknownIds.length ? `section id(s) ${JSON.stringify(unknownIds)}` : '',
+    ].filter(Boolean).join(', ');
+    const knownList = sections.length ? sections.map(s => `"${s.name}" (id ${s.id})`).join(', ') : '(no Plex library sections found)';
+    return `No configured Plex library section matches ${problems}. Known sections: ${knownList}.`;
+  }
+
   return [
     {
       name: 'plex_search_media',
@@ -300,28 +379,31 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
 
     {
       name: 'plex_list_library',
-      description: 'List existing Radarr movies and/or Sonarr series with ids, titles, root folders, quality profiles, monitored state, file status, content rating, and optional filters. Use query/filters plus limit/offset to keep responses small. Set includePlexSection (or any plexLibrarySection*/library filter) to cross-reference each title against the actual Plex library section it lives in, so you can spot e.g. kids-rated titles sitting in an adult Plex library or the wrong root folder.',
+      description: 'List existing Radarr movies and/or Sonarr series with ids, titles, root folders, quality profiles, monitored state, file status, content rating, and optional filters. Use query/filters plus limit/offset to keep responses small; check movieHasMore/seriesHasMore and repeat with a higher offset to see everything that matches. Set includePlexSection (or any plexLibrarySection*/library filter) to cross-reference each title against the actual Plex library section it lives in. Example — find kid-safe titles (movies PG-13 or below, shows TV-Y7 or below) that ended up outside your Kids root folders, in one call: { mediaType: "all", ratingOperator: "lte", movieRatingValue: "PG-13", showRatingValue: "TV-Y7", excludeRootFolderPath: "/Kids/" }.',
       inputSchema: {
         type: 'object',
         properties: {
           mediaType: { type: 'string', enum: ['all', 'movie', 'show'], default: 'all' },
           query: { type: 'string', description: 'Optional case-insensitive title/id/rating/status search term.' },
           rootFolderPath: { type: ['string', 'array'], items: { type: 'string' }, description: 'Optional root folder path filter; accepts a string, comma-separated string, or array. Partial matches allowed.' },
+          excludeRootFolderPath: { type: ['string', 'array'], items: { type: 'string' }, description: 'Optional root folder path(s) to exclude, e.g. "/Kids/", to find titles matching your other filters whose root folder is NOT one of these. Partial match.' },
           qualityProfileId: { type: ['number', 'array'], items: { type: 'number' }, description: 'Optional Radarr/Sonarr quality profile id filter.' },
           qualityProfileName: { type: ['string', 'array'], items: { type: 'string' }, description: 'Optional quality profile name filter. Partial matches allowed.' },
           contentRating: { type: ['string', 'array'], items: { type: 'string' }, description: 'Optional certification/content rating filter, such as PG-13 or TV-MA. Partial match; use ratingOperator/ratingValue for ladder comparisons instead of enumerating every rating.' },
-          ratingOperator: { type: 'string', enum: ['eq', 'ne', 'lt', 'lte', 'gt', 'gte'], description: 'Optional comparison applied to each title\'s contentRating against ratingValue. lt/lte/gt/gte rank against the MPAA ladder (G < PG < PG-13 < R < NC-17) for movies and the TV ladder (TV-Y < TV-Y7 < TV-Y7-FV < TV-G < TV-PG < TV-14 < TV-MA) for shows; unrecognized ratings never match a ladder comparison. Use e.g. gt with ratingValue "PG-13" to find mature movies, or lte with ratingValue "TV-Y7" to find kids shows.' },
-          ratingValue: { type: 'string', description: 'Rating to compare against when ratingOperator is set, e.g. "PG-13" or "TV-Y7".' },
+          ratingOperator: { type: 'string', enum: ['eq', 'ne', 'lt', 'lte', 'gt', 'gte'], description: 'Optional comparison applied to each title\'s contentRating. lt/lte/gt/gte rank against the MPAA ladder (G < PG < PG-13 < R < NC-17) for movies and the TV ladder (TV-Y < TV-Y7 < TV-Y7-FV < TV-G < TV-PG < TV-14 < TV-MA) for shows; unrecognized ratings never match a ladder comparison. Rating text is matched loosely (dashes/spaces/case ignored), but must use the real codes above — there is no "TV-7", the code for young kids is "TV-Y7". Use e.g. gt with ratingValue "PG-13" to find mature movies, or lte with ratingValue "TV-Y7" to find kids shows.' },
+          ratingValue: { type: 'string', description: 'Default rating to compare against for both movies and shows when ratingOperator is set, e.g. "PG-13" or "TV-Y7". Overridden per media type by movieRatingValue/showRatingValue when those are also set. IMPORTANT: with mediaType "all" (the default), a single ratingValue must be valid on BOTH the movie and TV ladders to filter both types — since no rating code is ever valid on both, a bare ratingValue under mediaType "all" will error for whichever type it does not match. Set movieRatingValue and showRatingValue explicitly whenever mediaType is "all" and you want a rating filter applied (e.g. "PG-13 or below" for movies AND "TV-Y7 or below" for shows), or narrow mediaType to just "movie"/"show".' },
+          movieRatingValue: { type: 'string', description: 'Rating to compare movies against when ratingOperator is set; overrides ratingValue for movies only.' },
+          showRatingValue: { type: 'string', description: 'Rating to compare shows against when ratingOperator is set; overrides ratingValue for shows only.' },
           monitored: { type: 'boolean', description: 'Optional monitored/unmonitored filter.' },
           hasFile: { type: 'boolean', description: 'Optional file-present filter. For shows, true means episodeFileCount > 0.' },
           status: { type: ['string', 'array'], items: { type: 'string' }, description: 'Optional Radarr/Sonarr status filter.' },
           year: { type: ['number', 'array'], items: { type: 'number' }, description: 'Optional exact year filter.' },
           minYear: { type: 'number', description: 'Optional minimum release year.' },
           maxYear: { type: 'number', description: 'Optional maximum release year.' },
-          includePlexSection: { type: 'boolean', default: false, description: 'When true, look up each title in Plex and attach plexLibrarySectionId/plexLibrarySectionName. Automatically enabled when a plexLibrarySection or excludePlexLibrarySection filter is set.' },
-          plexLibrarySectionName: { type: ['string', 'array'], items: { type: 'string' }, description: 'Optional Plex library (section) name filter, e.g. "Kids Movies". Partial match. Implies includePlexSection.' },
-          plexLibrarySectionId: { type: ['string', 'array'], items: { type: 'string' }, description: 'Optional Plex library (section) id filter. Implies includePlexSection.' },
-          excludePlexLibrarySectionName: { type: ['string', 'array'], items: { type: 'string' }, description: 'Optional Plex library (section) name(s) to exclude, e.g. "Kids Movies", to find titles matching your other filters that live outside those libraries. Partial match. Implies includePlexSection.' },
+          includePlexSection: { type: 'boolean', default: false, description: 'When true, look up each title in Plex and attach plexLibrarySectionId/plexLibrarySectionName. Automatically enabled when a plexLibrarySection or excludePlexLibrarySection filter is set. Prefer rootFolderPath/excludeRootFolderPath instead when you already know the Radarr/Sonarr root folder — it needs no Plex lookup. Use plexLibrarySection* only when you actually need the real Plex library section name (check plex_get_library_stats first).' },
+          plexLibrarySectionName: { type: ['string', 'array'], items: { type: 'string' }, description: 'Optional Plex library (section) name filter, e.g. "Kids Movies". Partial match against a real configured section name — look up exact names with plex_list_library_sections first; a name that matches no configured section returns an error listing the real ones instead of silently matching zero items. Implies includePlexSection.' },
+          plexLibrarySectionId: { type: ['string', 'array'], items: { type: 'string' }, description: 'Optional Plex library (section) id filter (exact match against a real configured section id — errors listing known sections if none match). Implies includePlexSection.' },
+          excludePlexLibrarySectionName: { type: ['string', 'array'], items: { type: 'string' }, description: 'Optional Plex library (section) name(s) to exclude, e.g. "Kids Movies", to find titles matching your other filters that live outside those libraries. Partial match against a real configured section name (errors listing known sections if none match). Implies includePlexSection.' },
           sortBy: { type: 'string', enum: ['title', 'year', 'rootFolderPath', 'qualityProfileId', 'qualityProfileName', 'contentRating', 'status', 'plexLibrarySectionName'], description: 'Optional result sort key.' },
           sortDirection: { type: 'string', enum: ['asc', 'desc'], default: 'asc' },
           limit: { type: 'number', default: 50, description: 'Maximum items returned per media type. Capped at 200.' },
@@ -332,11 +414,14 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
         const mediaType = String(input.mediaType ?? 'all');
         const query = stringParam(input.query).toLowerCase();
         const rootFolderFilters = stringFilters(input.rootFolderPath, input.rootFolder, input.rootFolderQuery);
+        const excludeRootFolderFilters = stringFilters(input.excludeRootFolderPath, input.excludeRootFolderPaths);
         const qualityProfileIds = numberFilters(input.qualityProfileId, input.qualityProfileIds);
         const qualityProfileNames = stringFilters(input.qualityProfileName, input.qualityProfileNames);
         const contentRatings = stringFilters(input.contentRating, input.contentRatings, input.certification);
         const ratingOperator = stringParam(input.ratingOperator);
         const ratingValue = stringParam(input.ratingValue);
+        const movieRatingValue = stringParam(input.movieRatingValue) || ratingValue;
+        const showRatingValue = stringParam(input.showRatingValue) || ratingValue;
         const statusFilters = stringFilters(input.status);
         const years = numberFilters(input.year, input.years);
         const monitored = boolParam(input.monitored);
@@ -352,8 +437,13 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
         const sortDirection = stringParam(input.sortDirection || 'asc');
         const result: Record<string, unknown> = {};
 
+        const operatorError = validateRatingOperator(ratingOperator);
+        if (operatorError) return { error: operatorError };
+
         let plexCatalogIndex: ReturnType<typeof buildPlexCatalogIndex> | undefined;
         if (needsPlexSection && clients.plex) {
+          const sectionFilterError = await validatePlexSectionFilters(plexSectionNames, plexSectionIds, excludePlexSectionNames);
+          if (sectionFilterError) return { error: sectionFilterError };
           try {
             plexCatalogIndex = buildPlexCatalogIndex(await clients.plex.getLibraryMedia());
           } catch (e) {
@@ -361,7 +451,10 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
           }
         }
 
-        if ((mediaType === 'all' || mediaType === 'movie') && clients.radarr) {
+        const movieRatingError = validateRatingValue(ratingOperator, movieRatingValue, 'movie');
+        if ((mediaType === 'all' || mediaType === 'movie') && clients.radarr && movieRatingError) {
+          result.moviesError = movieRatingError;
+        } else if ((mediaType === 'all' || mediaType === 'movie') && clients.radarr) {
           try {
             let profileNames = new Map<number, string>();
             if (qualityProfileNames.length || sortBy === 'qualityProfileName') {
@@ -395,7 +488,6 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
               stringFilters: [
                 { keys: ['rootFolderPath'], filters: rootFolderFilters },
                 { keys: ['qualityProfileName'], filters: qualityProfileNames },
-                { keys: ['contentRating'], filters: contentRatings },
                 { keys: ['status'], filters: statusFilters },
                 { keys: ['plexLibrarySectionName'], filters: plexSectionNames },
                 { keys: ['plexLibrarySectionId'], filters: plexSectionIds },
@@ -409,9 +501,11 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
                 { key: 'hasFile', value: hasFile },
               ],
             }).filter(m => {
+              if (!matchesContentRatingFilters(m.contentRating, contentRatings)) return false;
               if (Number.isFinite(minYear) && Number(m.year) < Number(minYear)) return false;
               if (Number.isFinite(maxYear) && Number(m.year) > Number(maxYear)) return false;
-              if (ratingOperator && ratingValue && !matchesRatingOperator(m.contentRating, 'movie', ratingOperator, ratingValue)) return false;
+              if (ratingOperator && movieRatingValue && !matchesRatingOperator(m.contentRating, 'movie', ratingOperator, movieRatingValue)) return false;
+              if (excludeRootFolderFilters.length && matchesStringFilters(m.rootFolderPath, excludeRootFolderFilters)) return false;
               if (excludePlexSectionNames.length && matchesStringFilters(m.plexLibrarySectionName, excludePlexSectionNames)) return false;
               return true;
             });
@@ -439,7 +533,10 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
           }
         }
 
-        if ((mediaType === 'all' || mediaType === 'show') && clients.sonarr) {
+        const showRatingError = validateRatingValue(ratingOperator, showRatingValue, 'show');
+        if ((mediaType === 'all' || mediaType === 'show') && clients.sonarr && showRatingError) {
+          result.seriesError = showRatingError;
+        } else if ((mediaType === 'all' || mediaType === 'show') && clients.sonarr) {
           try {
             let profileNames = new Map<number, string>();
             if (qualityProfileNames.length || sortBy === 'qualityProfileName') {
@@ -476,7 +573,6 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
               stringFilters: [
                 { keys: ['rootFolderPath'], filters: rootFolderFilters },
                 { keys: ['qualityProfileName'], filters: qualityProfileNames },
-                { keys: ['contentRating'], filters: contentRatings },
                 { keys: ['status'], filters: statusFilters },
                 { keys: ['plexLibrarySectionName'], filters: plexSectionNames },
                 { keys: ['plexLibrarySectionId'], filters: plexSectionIds },
@@ -490,9 +586,11 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
                 { key: 'hasFile', value: hasFile },
               ],
             }).filter(s => {
+              if (!matchesContentRatingFilters(s.contentRating, contentRatings)) return false;
               if (Number.isFinite(minYear) && Number(s.year) < Number(minYear)) return false;
               if (Number.isFinite(maxYear) && Number(s.year) > Number(maxYear)) return false;
-              if (ratingOperator && ratingValue && !matchesRatingOperator(s.contentRating, 'show', ratingOperator, ratingValue)) return false;
+              if (ratingOperator && showRatingValue && !matchesRatingOperator(s.contentRating, 'show', ratingOperator, showRatingValue)) return false;
+              if (excludeRootFolderFilters.length && matchesStringFilters(s.rootFolderPath, excludeRootFolderFilters)) return false;
               if (excludePlexSectionNames.length && matchesStringFilters(s.plexLibrarySectionName, excludePlexSectionNames)) return false;
               return true;
             });
@@ -530,17 +628,19 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
 
     {
       name: 'plex_list_library_media',
-      description: 'List titles actually inside Plex library sections (as scanned by Plex itself), with content rating, so the AI can find e.g. kids-rated titles sitting in an adult library or mature titles sitting in a kids library. Use plex_get_library_stats first to find section ids/names, then pass sectionName/sectionId here. Combine with ratingOperator/ratingValue to filter by rating.',
+      description: 'List titles actually inside Plex library sections (as scanned by Plex itself), with content rating, so the AI can find e.g. kids-rated titles sitting in an adult library or mature titles sitting in a kids library. Use plex_get_library_stats first to find section ids/names, then pass sectionName/sectionId here. Combine with ratingOperator/ratingValue (or movieRatingValue/showRatingValue when movies and shows need different thresholds) to filter by rating.',
       inputSchema: {
         type: 'object',
         properties: {
-          sectionId: { type: ['string', 'array'], items: { type: 'string' }, description: 'Optional Plex library section id filter.' },
-          sectionName: { type: ['string', 'array'], items: { type: 'string' }, description: 'Optional Plex library section name filter, e.g. "Kids Movies". Partial match.' },
+          sectionId: { type: ['string', 'array'], items: { type: 'string' }, description: 'Optional Plex library section id filter (exact match against a real configured section id — errors listing known sections if none match).' },
+          sectionName: { type: ['string', 'array'], items: { type: 'string' }, description: 'Optional Plex library section name filter, e.g. "Kids Movies". Partial match against a real configured section name — look up exact names with plex_list_library_sections first; a name that matches no configured section returns an error listing the real ones instead of silently matching zero items.' },
           mediaType: { type: 'string', enum: ['all', 'movie', 'show'], default: 'all' },
           query: { type: 'string', description: 'Optional case-insensitive title search term.' },
           contentRating: { type: ['string', 'array'], items: { type: 'string' }, description: 'Optional certification/content rating filter, such as PG-13 or TV-MA. Partial match; use ratingOperator/ratingValue for ladder comparisons.' },
-          ratingOperator: { type: 'string', enum: ['eq', 'ne', 'lt', 'lte', 'gt', 'gte'], description: 'Optional comparison applied to each title\'s contentRating against ratingValue. lt/lte/gt/gte rank against the MPAA ladder (G < PG < PG-13 < R < NC-17) for movies and the TV ladder (TV-Y < TV-Y7 < TV-Y7-FV < TV-G < TV-PG < TV-14 < TV-MA) for shows; unrecognized ratings never match a ladder comparison. Use e.g. gt with ratingValue "PG-13" to find mature movies in a kids library, or lte with ratingValue "TV-Y7" to find kids shows stranded in an adult library.' },
-          ratingValue: { type: 'string', description: 'Rating to compare against when ratingOperator is set, e.g. "PG-13" or "TV-Y7".' },
+          ratingOperator: { type: 'string', enum: ['eq', 'ne', 'lt', 'lte', 'gt', 'gte'], description: 'Optional comparison applied to each title\'s contentRating. lt/lte/gt/gte rank against the MPAA ladder (G < PG < PG-13 < R < NC-17) for movies and the TV ladder (TV-Y < TV-Y7 < TV-Y7-FV < TV-G < TV-PG < TV-14 < TV-MA) for shows; unrecognized ratings never match a ladder comparison. Rating text is matched loosely (dashes/spaces/case ignored), but must use the real codes above — there is no "TV-7", the code for young kids is "TV-Y7". Use e.g. gt with ratingValue "PG-13" to find mature movies in a kids library, or lte with ratingValue "TV-Y7" to find kids shows stranded in an adult library.' },
+          ratingValue: { type: 'string', description: 'Default rating to compare against for both movies and shows when ratingOperator is set, e.g. "PG-13" or "TV-Y7". Overridden per media type by movieRatingValue/showRatingValue when those are also set. IMPORTANT: with mediaType "all" (the default), a single ratingValue must be valid on BOTH the movie and TV ladders to filter both types — since no rating code is ever valid on both, a bare ratingValue under mediaType "all" will error for whichever type it does not match. Set movieRatingValue and showRatingValue explicitly whenever mediaType is "all" and you want a rating filter applied (e.g. "PG-13 or below" for movies AND "TV-Y7 or below" for shows), or narrow mediaType to just "movie"/"show".' },
+          movieRatingValue: { type: 'string', description: 'Rating to compare movies against when ratingOperator is set; overrides ratingValue for movies only.' },
+          showRatingValue: { type: 'string', description: 'Rating to compare shows against when ratingOperator is set; overrides ratingValue for shows only.' },
           year: { type: ['number', 'array'], items: { type: 'number' }, description: 'Optional exact year filter.' },
           minYear: { type: 'number', description: 'Optional minimum release year.' },
           maxYear: { type: 'number', description: 'Optional maximum release year.' },
@@ -560,12 +660,29 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
           const contentRatings = stringFilters(input.contentRating, input.contentRatings, input.certification);
           const ratingOperator = stringParam(input.ratingOperator);
           const ratingValue = stringParam(input.ratingValue);
+          const movieRatingValue = stringParam(input.movieRatingValue) || ratingValue;
+          const showRatingValue = stringParam(input.showRatingValue) || ratingValue;
           const years = numberFilters(input.year, input.years);
           const minYear = input.minYear == null ? undefined : Number(input.minYear);
           const maxYear = input.maxYear == null ? undefined : Number(input.maxYear);
           const sortBy = stringParam(input.sortBy);
           const sortDirection = stringParam(input.sortDirection || 'asc');
           const { limit, offset } = getPaging(input, 100, 500);
+
+          const operatorError = validateRatingOperator(ratingOperator);
+          if (operatorError) return { error: operatorError };
+          if (mediaType === 'all' || mediaType === 'movie') {
+            const err = validateRatingValue(ratingOperator, movieRatingValue, 'movie');
+            if (err) return { error: err };
+          }
+          if (mediaType === 'all' || mediaType === 'show') {
+            const err = validateRatingValue(ratingOperator, showRatingValue, 'show');
+            if (err) return { error: err };
+          }
+          if (sectionIds.length || sectionNames.length) {
+            const sectionFilterError = await validatePlexSectionFilters(sectionNames, sectionIds, []);
+            if (sectionFilterError) return { error: sectionFilterError };
+          }
 
           const media = await clients.plex.getLibraryMedia();
           let mapped = (mediaType === 'all' ? media : media.filter(item => item.type === mediaType)) as unknown as AnyRecord[];
@@ -575,15 +692,16 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
             stringFilters: [
               { keys: ['sectionId'], filters: sectionIds },
               { keys: ['sectionName'], filters: sectionNames },
-              { keys: ['contentRating'], filters: contentRatings },
             ],
             numberFilters: [{ keys: ['year'], filters: years }],
           }).filter(item => {
+            if (!matchesContentRatingFilters(item.contentRating, contentRatings)) return false;
             if (Number.isFinite(minYear) && Number(item.year) < Number(minYear)) return false;
             if (Number.isFinite(maxYear) && Number(item.year) > Number(maxYear)) return false;
-            if (ratingOperator && ratingValue) {
+            if (ratingOperator) {
               const type = item.type === 'show' ? 'show' : 'movie';
-              if (!matchesRatingOperator(item.contentRating, type, ratingOperator, ratingValue)) return false;
+              const effectiveValue = type === 'show' ? showRatingValue : movieRatingValue;
+              if (effectiveValue && !matchesRatingOperator(item.contentRating, type, ratingOperator, effectiveValue)) return false;
             }
             return true;
           });
@@ -984,7 +1102,7 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
 
     {
       name: 'plex_get_library_stats',
-      description: 'Get Plex library statistics including movie and TV show counts per library section. Use this to find library section ids/names, then pass them to plex_list_library_media to list and rating-filter what is actually inside a given library.',
+      description: 'Get Plex library statistics: movie/TV show counts per library section. Also returns each section\'s id and name — the exact values to pass to plexLibrarySectionName/plexLibrarySectionId/excludePlexLibrarySectionName (on plex_list_library) or sectionName/sectionId (on plex_list_library_media). Same lookup as plex_list_library_sections.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -995,22 +1113,24 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
         },
       },
       async execute(input) {
-        if (!clients.plex) return { error: 'Plex not configured' };
-        try {
-          const query = stringParam(input.query).toLowerCase();
-          const mediaTypes = stringFilters(input.mediaType, input.mediaTypes, input.type);
-          const { limit, offset } = getPaging(input, 50, 100);
-          const libs = await clients.plex.getLibraryCounts();
-          const filtered = filterRecords(libs as unknown as AnyRecord[], {
-            query,
-            queryKeys: ['id', 'name', 'type'],
-            stringFilters: [{ keys: ['type'], filters: mediaTypes }],
-          });
-          const paged = pageItems(filtered, limit, offset);
-          return { ...pageMeta(filtered.length, paged.length, limit, offset), libraries: paged };
-        } catch (e) {
-          return { error: String(e) };
-        }
+        return listLibrarySections(input);
+      },
+    },
+
+    {
+      name: 'plex_list_library_sections',
+      description: 'List Plex library sections (id, name, type, item count). Call this first to look up the exact section id/name to plug into plexLibrarySectionName/plexLibrarySectionId/excludePlexLibrarySectionName (on plex_list_library) or sectionName/sectionId (on plex_list_library_media) — those filters match against the `name` value returned here, e.g. "Kids Movies". Same lookup as plex_get_library_stats.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Optional case-insensitive library name/id filter.' },
+          mediaType: { type: ['string', 'array'], items: { type: 'string' }, description: 'Optional Plex library type filter.' },
+          limit: { type: 'number', default: 50, description: 'Maximum library sections returned. Capped at 100.' },
+          offset: { type: 'number', default: 0 },
+        },
+      },
+      async execute(input) {
+        return listLibrarySections(input);
       },
     },
 
