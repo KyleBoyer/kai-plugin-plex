@@ -161,6 +161,42 @@ async function testPlexLibraryIndexExtractsSectionIds() {
   assert.equal(index.media[1].tvdbId, 371980);
 }
 
+async function testPlexLibraryMediaWarmCacheAndRefreshInvalidation() {
+  const { PlexClient } = await importTs('/Users/kyleboyer/git/kai-plugin-plex/src/main/clients/plex.ts');
+  let metadataFetches = 0;
+  let releaseMetadata;
+  const metadataGate = new Promise(resolve => { releaseMetadata = resolve; });
+  const client = new PlexClient('http://plex', 'token', async (url, init = {}) => {
+    const s = String(url);
+    if (s.includes('/library/sections?')) {
+      return jsonResponse({ MediaContainer: { Directory: [{ key: '1', title: 'Movies', type: 'movie' }] } });
+    }
+    if (s.includes('/library/sections/1/all')) {
+      metadataFetches += 1;
+      if (metadataFetches === 1) await metadataGate;
+      return jsonResponse({ MediaContainer: { totalSize: 1, Metadata: [{ title: 'Arrival', year: 2016 }] } });
+    }
+    if (s.includes('/library/sections/1/refresh')) {
+      assert.equal(init.method, undefined);
+      return new Response('', { status: 200 });
+    }
+    return new Response('', { status: 404 });
+  });
+
+  const first = client.getLibraryMedia();
+  const concurrent = client.getLibraryMedia();
+  releaseMetadata();
+  assert.deepEqual(await first, await concurrent);
+  assert.equal(metadataFetches, 1, 'concurrent catalog reads should share one Plex request');
+
+  await client.getLibraryMedia();
+  assert.equal(metadataFetches, 1, 'warm catalog read should use the 60-second cache');
+
+  await client.refreshLibrary('1');
+  await client.getLibraryMedia();
+  assert.equal(metadataFetches, 2, 'refresh must invalidate the catalog cache');
+}
+
 async function testPollerAttachesPlexLibrarySections() {
   const { Poller } = await importTs('/Users/kyleboyer/git/kai-plugin-plex/src/main/poller.ts');
   const state = new Map();
@@ -653,8 +689,9 @@ async function testListLibraryRatingValidationRejectsInvalidInput() {
   const badOperator = await listLibrary.execute({ ratingOperator: 'greater-than', ratingValue: 'PG' });
   assert.match(badOperator.error, /Unrecognized ratingOperator/);
 
-  // Explicitly scoped (mediaType: 'movie') invalid value: hard error, not a silent empty result.
-  const badExplicitValue = await listLibrary.execute({ mediaType: 'movie', ratingOperator: 'lte', ratingValue: 'TV-7' });
+  // Explicitly scoped invalid values still fail rather than silently matching
+  // nothing. TV-7 itself is now an intentional alias of TV-Y7, so use TV-8.
+  const badExplicitValue = await listLibrary.execute({ mediaType: 'movie', ratingOperator: 'lte', ratingValue: 'TV-8' });
   assert.match(badExplicitValue.moviesError, /not a recognized movie rating/);
 
   // Shared ratingValue under the default mediaType 'all': "PG-13" is a valid movie rating but
@@ -666,6 +703,80 @@ async function testListLibraryRatingValidationRejectsInvalidInput() {
   assert.equal(sharedValue.movies[0].title, 'Paddington');
   assert.match(sharedValue.seriesError, /not a recognized TV rating/);
   assert.equal(sharedValue.series, undefined);
+}
+
+async function testListLibraryCompactCrossMediaAndLocationPolicy() {
+  const { buildPlexTools } = await importTs('/Users/kyleboyer/git/kai-plugin-plex/src/main/tools.ts');
+  const tools = buildPlexTools({
+    radarr: {
+      getQualityProfiles: async () => [],
+      getMovies: async () => [
+        { id: 1, title: 'Root Match', year: 2020, tmdbId: 1, rootFolderPath: '/srv/Family Zone/movies', certification: 'PG' },
+        { id: 2, title: 'Section Match', year: 2021, tmdbId: 2, rootFolderPath: '/srv/movies', certification: 'PG-13' },
+        { id: 3, title: 'Outside Safe', year: 2022, tmdbId: 3, rootFolderPath: '/srv/movies', certification: 'PG-13' },
+        { id: 4, title: 'Outside Adult', year: 2023, tmdbId: 4, rootFolderPath: '/srv/movies', certification: 'R' },
+        { id: 5, title: 'Unknown Location', year: 2024, tmdbId: 5, rootFolderPath: '/srv/movies', certification: 'G' },
+      ],
+    },
+    sonarr: {
+      getQualityProfiles: async () => [],
+      getSeries: async () => [
+        { id: 6, title: 'Outside TV Safe', year: 2022, tvdbId: 6, rootFolderPath: '/srv/tv', certification: 'TV-14', episodeCount: 1, episodeFileCount: 1 },
+        { id: 7, title: 'Outside TV Adult', year: 2022, tvdbId: 7, rootFolderPath: '/srv/tv', certification: 'TV-MA', episodeCount: 1, episodeFileCount: 1 },
+      ],
+    },
+    plex: {
+      getLibraryMedia: async () => [
+        { sectionId: '1', sectionName: 'Movies', type: 'movie', title: 'Root Match', year: 2020, tmdbId: 1 },
+        { sectionId: '2', sectionName: 'Family Zone', type: 'movie', title: 'Section Match', year: 2021, tmdbId: 2 },
+        { sectionId: '1', sectionName: 'Movies', type: 'movie', title: 'Outside Safe', year: 2022, tmdbId: 3 },
+        { sectionId: '1', sectionName: 'Movies', type: 'movie', title: 'Outside Adult', year: 2023, tmdbId: 4 },
+        { sectionId: '3', sectionName: 'Television', type: 'show', title: 'Outside TV Safe', year: 2022, tvdbId: 6 },
+        { sectionId: '3', sectionName: 'Television', type: 'show', title: 'Outside TV Adult', year: 2022, tvdbId: 7 },
+      ],
+    },
+  });
+  const listLibrary = tools.find(tool => tool.name === 'plex_list_library');
+  const properties = listLibrary.inputSchema.properties;
+
+  // The model-facing contract stays compact and contains no installation-
+  // specific path or section default.
+  assert.equal(Object.keys(properties).length, 9);
+  assert.equal(JSON.stringify(listLibrary.inputSchema).includes('/Kids/'), false);
+  assert.equal(JSON.stringify(listLibrary.inputSchema).includes('Kids Movies'), false);
+  assert.equal(listLibrary.inputSchema.additionalProperties, true);
+
+  const result = await listLibrary.execute({
+    mediaType: 'all',
+    maxContentRating: 'PG-13',
+    excludeLocationName: 'Family Zone',
+  });
+  assert.deepEqual(result.movies.map(item => item.title), ['Outside Safe']);
+  assert.deepEqual(result.series.map(item => item.title), ['Outside TV Safe']);
+  assert.equal(result.ratingPolicy.movieMaxRating, 'PG-13');
+  assert.equal(result.ratingPolicy.showMaxRating, 'TV-14');
+  assert.equal(result.movieLocationUnknownExcluded, 1);
+}
+
+async function testListLibraryRatingAliasAndExplicitPair() {
+  const { buildPlexTools } = await importTs('/Users/kyleboyer/git/kai-plugin-plex/src/main/tools.ts');
+  const tools = buildPlexTools({
+    radarr: { getQualityProfiles: async () => [], getMovies: async () => [
+      { id: 1, title: 'Movie', certification: 'PG-13' },
+    ] },
+    sonarr: { getQualityProfiles: async () => [], getSeries: async () => [
+      { id: 2, title: 'Young Show', certification: 'TV-Y7', episodeCount: 1, episodeFileCount: 1 },
+      { id: 3, title: 'Older Show', certification: 'TV-PG', episodeCount: 1, episodeFileCount: 1 },
+    ] },
+  });
+  const listLibrary = tools.find(tool => tool.name === 'plex_list_library');
+  const result = await listLibrary.execute({
+    mediaType: 'all',
+    movieMaxRating: 'PG-13',
+    showMaxRating: 'TV-7',
+  });
+  assert.deepEqual(result.movies.map(item => item.title), ['Movie']);
+  assert.deepEqual(result.series.map(item => item.title), ['Young Show']);
 }
 
 async function testPlexSectionFiltersRejectUnknownSectionNames() {
@@ -783,6 +894,7 @@ await testRadarrFullToggle();
 await testSeerTvUsesTmdb();
 await testTautulliNoApiKeyUrl();
 await testPlexLibraryIndexExtractsSectionIds();
+await testPlexLibraryMediaWarmCacheAndRefreshInvalidation();
 await testPollerAttachesPlexLibrarySections();
 await testPollerEmitsAutomationEvents();
 await testPollerDoesNotOverlapFastPolls();
@@ -795,6 +907,8 @@ await testListLibraryContentRatingToleratesFormatting();
 await testListLibraryRatingValidationRejectsInvalidInput();
 await testPlexSectionFiltersRejectUnknownSectionNames();
 await testListLibrarySingleCallKidsRatingAcrossRootFolders();
+await testListLibraryCompactCrossMediaAndLocationPolicy();
+await testListLibraryRatingAliasAndExplicitPair();
 await testListLibrarySectionsAliasesLibraryStats();
 await testGetDownloadsFiltersAndTrimsStatus();
 

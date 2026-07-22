@@ -4,6 +4,10 @@ export class PlexClient {
   private url: string;
   private token: string;
   private fetchFn: typeof fetch;
+  private libraryMediaCache?: { expiresAt: number; items: PlexLibraryItem[] };
+  private libraryMediaPending?: Promise<PlexLibraryItem[]>;
+
+  private static readonly LIBRARY_MEDIA_CACHE_MS = 60_000;
 
   constructor(url: string, token: string, fetchFn: typeof fetch) {
     this.url = url.replace(/\/$/, '');
@@ -92,6 +96,25 @@ export class PlexClient {
   }
 
   async getLibraryMedia(libraries?: LibraryStat[]): Promise<PlexLibraryItem[]> {
+    const cached = this.libraryMediaCache;
+    if (cached && cached.expiresAt > Date.now()) return [...cached.items];
+    if (this.libraryMediaPending) return [...await this.libraryMediaPending];
+
+    const pending = this.fetchLibraryMedia(libraries);
+    this.libraryMediaPending = pending;
+    try {
+      const items = await pending;
+      this.libraryMediaCache = {
+        expiresAt: Date.now() + PlexClient.LIBRARY_MEDIA_CACHE_MS,
+        items,
+      };
+      return [...items];
+    } finally {
+      if (this.libraryMediaPending === pending) this.libraryMediaPending = undefined;
+    }
+  }
+
+  private async fetchLibraryMedia(libraries?: LibraryStat[]): Promise<PlexLibraryItem[]> {
     const libs = libraries ?? await this.getLibraries();
     const media: PlexLibraryItem[] = [];
     for (const lib of libs) {
@@ -115,6 +138,10 @@ export class PlexClient {
       }
     }
     return media;
+  }
+
+  clearLibraryMediaCache(): void {
+    this.libraryMediaCache = undefined;
   }
 
   private async getSectionMetadata(sectionId: string): Promise<PlexMetadata[]> {
@@ -176,6 +203,7 @@ export class PlexClient {
       signal: AbortSignal.timeout(10000),
     });
     if (!res.ok) throw new Error(`Plex refresh library ${id}: ${res.status}`);
+    this.clearLibraryMediaCache();
   }
 
   async refreshAllLibraries(): Promise<{ refreshed: LibraryStat[] }> {

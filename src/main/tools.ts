@@ -148,10 +148,39 @@ function filterRecords<T extends AnyRecord>(
 const MOVIE_RATING_ORDER = ['G', 'PG', 'PG-13', 'R', 'NC-17'];
 const TV_RATING_ORDER = ['TV-Y', 'TV-Y7', 'TV-Y7-FV', 'TV-G', 'TV-PG', 'TV-14', 'TV-MA'];
 
+// A deliberately small, auditable crosswalk for callers that provide one
+// ceiling for a mixed movie/TV query. These systems are not literally the
+// same scale, so the response reports the resolved pair. Callers can override
+// either side explicitly when their household policy differs.
+const MOVIE_TO_TV_RATING = new Map([
+  ['G', 'TV-G'],
+  ['PG', 'TV-PG'],
+  ['PG-13', 'TV-14'],
+  ['R', 'TV-MA'],
+  ['NC-17', 'TV-MA'],
+]);
+const TV_TO_MOVIE_RATING = new Map([
+  ['TV-Y', 'G'],
+  ['TV-Y7', 'PG'],
+  ['TV-Y7-FV', 'PG'],
+  ['TV-G', 'G'],
+  ['TV-PG', 'PG'],
+  ['TV-14', 'PG-13'],
+  ['TV-MA', 'R'],
+]);
+
 // Ratings are compared with dashes/spaces stripped so common formatting variants
 // (e.g. "PG13", "PG 13", "PG-13") all resolve to the same ladder position.
 function normalizeRatingKey(value: unknown): string {
   return String(value ?? '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
+
+function canonicalRatingKey(value: unknown, mediaType: 'movie' | 'show'): string {
+  const key = normalizeRatingKey(value);
+  // Common model/user shorthand. This is intentionally explicit rather than
+  // fuzzy: unknown ratings must continue to fail closed.
+  if (mediaType === 'show' && key === 'TV7') return 'TVY7';
+  return key;
 }
 
 const MOVIE_RATING_RANK = new Map(MOVIE_RATING_ORDER.map((rating, idx) => [normalizeRatingKey(rating), idx]));
@@ -159,7 +188,67 @@ const TV_RATING_RANK = new Map(TV_RATING_ORDER.map((rating, idx) => [normalizeRa
 
 function ratingRank(rating: unknown, mediaType: 'movie' | 'show'): number | undefined {
   const ranks = mediaType === 'show' ? TV_RATING_RANK : MOVIE_RATING_RANK;
-  return ranks.get(normalizeRatingKey(rating));
+  return ranks.get(canonicalRatingKey(rating, mediaType));
+}
+
+function canonicalRating(value: unknown, mediaType: 'movie' | 'show'): string | undefined {
+  const key = canonicalRatingKey(value, mediaType);
+  const order = mediaType === 'show' ? TV_RATING_ORDER : MOVIE_RATING_ORDER;
+  return order.find(rating => normalizeRatingKey(rating) === key);
+}
+
+function resolveMixedRatingCeilings(input: AnyRecord): {
+  operator: string;
+  movieValue: string;
+  showValue: string;
+  policy?: AnyRecord;
+  error?: string;
+} {
+  const automaticValue = stringParam(input.maxContentRating);
+  const legacyValue = stringParam(input.ratingValue);
+  let movieValue = stringParam(input.movieMaxRating ?? input.movieRatingValue);
+  let showValue = stringParam(input.showMaxRating ?? input.showRatingValue);
+  let operator = stringParam(input.ratingOperator);
+  let convertedFrom: string | undefined;
+
+  if (automaticValue) {
+    operator = operator || 'lte';
+    const movie = canonicalRating(automaticValue, 'movie');
+    const show = canonicalRating(automaticValue, 'show');
+    if (movie) {
+      movieValue ||= movie;
+      showValue ||= MOVIE_TO_TV_RATING.get(movie) ?? '';
+      convertedFrom = 'movie';
+    } else if (show) {
+      showValue ||= show;
+      movieValue ||= TV_TO_MOVIE_RATING.get(show) ?? '';
+      convertedFrom = 'show';
+    } else {
+      return {
+        operator,
+        movieValue,
+        showValue,
+        error: `Unrecognized maxContentRating "${automaticValue}". Use a movie rating (${MOVIE_RATING_ORDER.join(', ')}) or TV rating (${TV_RATING_ORDER.join(', ')}).`,
+      };
+    }
+  } else {
+    movieValue ||= legacyValue;
+    showValue ||= legacyValue;
+    if (input.movieMaxRating != null || input.showMaxRating != null) operator ||= 'lte';
+  }
+
+  const canonicalMovie = movieValue ? canonicalRating(movieValue, 'movie') : undefined;
+  const canonicalShow = showValue ? canonicalRating(showValue, 'show') : undefined;
+  if (canonicalMovie) movieValue = canonicalMovie;
+  if (canonicalShow) showValue = canonicalShow;
+  const policy = automaticValue ? {
+    requestedMaxContentRating: automaticValue,
+    convertedFrom,
+    movieMaxRating: movieValue,
+    showMaxRating: showValue,
+    comparison: operator,
+  } : undefined;
+  return { operator, movieValue, showValue, policy };
 }
 
 // Loose contentRating matching: substring match (so "PG" matches "PG-13") OR'd with a
@@ -193,8 +282,8 @@ function validateRatingValue(operator: string, value: string, mediaType: 'movie'
 }
 
 function matchesRatingOperator(rating: unknown, mediaType: 'movie' | 'show', operator: string, value: string): boolean {
-  const normalizedRating = normalizeRatingKey(rating);
-  const normalizedValue = normalizeRatingKey(value);
+  const normalizedRating = canonicalRatingKey(rating, mediaType);
+  const normalizedValue = canonicalRatingKey(value, mediaType);
   if (operator === 'eq') return normalizedRating === normalizedValue;
   if (operator === 'ne') return normalizedRating !== normalizedValue;
   const ratingIdx = ratingRank(rating, mediaType);
@@ -207,6 +296,29 @@ function matchesRatingOperator(rating: unknown, mediaType: 'movie' | 'show', ope
     case 'gte': return ratingIdx >= valueIdx;
     default: return false;
   }
+}
+
+function combinedLocationDecision(
+  item: AnyRecord,
+  includeFilters: string[],
+  excludeFilters: string[],
+): { include: boolean; unknown: boolean } {
+  if (!includeFilters.length && !excludeFilters.length) return { include: true, unknown: false };
+  const sectionKnown = Boolean(item.plexLibrarySectionKnown);
+  const rootMatchesInclude = includeFilters.length > 0 && matchesStringFilters(item.rootFolderPath, includeFilters);
+  const sectionMatchesInclude = includeFilters.length > 0 && sectionKnown && matchesStringFilters(item.plexLibrarySectionName, includeFilters);
+  const rootMatchesExclude = excludeFilters.length > 0 && matchesStringFilters(item.rootFolderPath, excludeFilters);
+  const sectionMatchesExclude = excludeFilters.length > 0 && sectionKnown && matchesStringFilters(item.plexLibrarySectionName, excludeFilters);
+
+  if (includeFilters.length && !rootMatchesInclude && !sectionMatchesInclude) {
+    return { include: false, unknown: !sectionKnown };
+  }
+  if (rootMatchesExclude || sectionMatchesExclude) return { include: false, unknown: false };
+  // When exclusion depends on either source, an item that is outside the root
+  // term but could not be cross-referenced to Plex is ambiguous. Fail closed
+  // instead of falsely declaring it outside the named location.
+  if (excludeFilters.length && !sectionKnown) return { include: false, unknown: true };
+  return { include: true, unknown: false };
 }
 
 // Cross-references Radarr/Sonarr titles against Plex's own library sections, so a title's
@@ -379,36 +491,23 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
 
     {
       name: 'plex_list_library',
-      description: 'List existing Radarr movies and/or Sonarr series with ids, titles, root folders, quality profiles, monitored state, file status, content rating, and optional filters. Use query/filters plus limit/offset to keep responses small; check movieHasMore/seriesHasMore and repeat with a higher offset to see everything that matches. Set includePlexSection (or any plexLibrarySection*/library filter) to cross-reference each title against the actual Plex library section it lives in. Example — find kid-safe titles (movies PG-13 or below, shows TV-Y7 or below) that ended up outside your Kids root folders, in one call: { mediaType: "all", ratingOperator: "lte", movieRatingValue: "PG-13", showRatingValue: "TV-Y7", excludeRootFolderPath: "/Kids/" }.',
+      description: 'List existing Radarr movies and Sonarr shows, filtered by content-rating ceiling and/or location. For a mixed query, maxContentRating automatically translates between the movie and TV rating systems and the response reports the resolved pair; movieMaxRating/showMaxRating can override either side. includeLocationName/excludeLocationName match the caller-supplied text against EITHER the root folder path OR Plex library section name, so installations do not need prescribed folder or section names. Check movieHasMore/seriesHasMore and increase offset to page.',
       inputSchema: {
         type: 'object',
         properties: {
           mediaType: { type: 'string', enum: ['all', 'movie', 'show'], default: 'all' },
           query: { type: 'string', description: 'Optional case-insensitive title/id/rating/status search term.' },
-          rootFolderPath: { type: ['string', 'array'], items: { type: 'string' }, description: 'Optional root folder path filter; accepts a string, comma-separated string, or array. Partial matches allowed.' },
-          excludeRootFolderPath: { type: ['string', 'array'], items: { type: 'string' }, description: 'Optional root folder path(s) to exclude, e.g. "/Kids/", to find titles matching your other filters whose root folder is NOT one of these. Partial match.' },
-          qualityProfileId: { type: ['number', 'array'], items: { type: 'number' }, description: 'Optional Radarr/Sonarr quality profile id filter.' },
-          qualityProfileName: { type: ['string', 'array'], items: { type: 'string' }, description: 'Optional quality profile name filter. Partial matches allowed.' },
-          contentRating: { type: ['string', 'array'], items: { type: 'string' }, description: 'Optional certification/content rating filter, such as PG-13 or TV-MA. Partial match; use ratingOperator/ratingValue for ladder comparisons instead of enumerating every rating.' },
-          ratingOperator: { type: 'string', enum: ['eq', 'ne', 'lt', 'lte', 'gt', 'gte'], description: 'Optional comparison applied to each title\'s contentRating. lt/lte/gt/gte rank against the MPAA ladder (G < PG < PG-13 < R < NC-17) for movies and the TV ladder (TV-Y < TV-Y7 < TV-Y7-FV < TV-G < TV-PG < TV-14 < TV-MA) for shows; unrecognized ratings never match a ladder comparison. Rating text is matched loosely (dashes/spaces/case ignored), but must use the real codes above — there is no "TV-7", the code for young kids is "TV-Y7". Use e.g. gt with ratingValue "PG-13" to find mature movies, or lte with ratingValue "TV-Y7" to find kids shows.' },
-          ratingValue: { type: 'string', description: 'Default rating to compare against for both movies and shows when ratingOperator is set, e.g. "PG-13" or "TV-Y7". Overridden per media type by movieRatingValue/showRatingValue when those are also set. IMPORTANT: with mediaType "all" (the default), a single ratingValue must be valid on BOTH the movie and TV ladders to filter both types — since no rating code is ever valid on both, a bare ratingValue under mediaType "all" will error for whichever type it does not match. Set movieRatingValue and showRatingValue explicitly whenever mediaType is "all" and you want a rating filter applied (e.g. "PG-13 or below" for movies AND "TV-Y7 or below" for shows), or narrow mediaType to just "movie"/"show".' },
-          movieRatingValue: { type: 'string', description: 'Rating to compare movies against when ratingOperator is set; overrides ratingValue for movies only.' },
-          showRatingValue: { type: 'string', description: 'Rating to compare shows against when ratingOperator is set; overrides ratingValue for shows only.' },
-          monitored: { type: 'boolean', description: 'Optional monitored/unmonitored filter.' },
-          hasFile: { type: 'boolean', description: 'Optional file-present filter. For shows, true means episodeFileCount > 0.' },
-          status: { type: ['string', 'array'], items: { type: 'string' }, description: 'Optional Radarr/Sonarr status filter.' },
-          year: { type: ['number', 'array'], items: { type: 'number' }, description: 'Optional exact year filter.' },
-          minYear: { type: 'number', description: 'Optional minimum release year.' },
-          maxYear: { type: 'number', description: 'Optional maximum release year.' },
-          includePlexSection: { type: 'boolean', default: false, description: 'When true, look up each title in Plex and attach plexLibrarySectionId/plexLibrarySectionName. Automatically enabled when a plexLibrarySection or excludePlexLibrarySection filter is set. Prefer rootFolderPath/excludeRootFolderPath instead when you already know the Radarr/Sonarr root folder — it needs no Plex lookup. Use plexLibrarySection* only when you actually need the real Plex library section name (check plex_get_library_stats first).' },
-          plexLibrarySectionName: { type: ['string', 'array'], items: { type: 'string' }, description: 'Optional Plex library (section) name filter, e.g. "Kids Movies". Partial match against a real configured section name — look up exact names with plex_list_library_sections first; a name that matches no configured section returns an error listing the real ones instead of silently matching zero items. Implies includePlexSection.' },
-          plexLibrarySectionId: { type: ['string', 'array'], items: { type: 'string' }, description: 'Optional Plex library (section) id filter (exact match against a real configured section id — errors listing known sections if none match). Implies includePlexSection.' },
-          excludePlexLibrarySectionName: { type: ['string', 'array'], items: { type: 'string' }, description: 'Optional Plex library (section) name(s) to exclude, e.g. "Kids Movies", to find titles matching your other filters that live outside those libraries. Partial match against a real configured section name (errors listing known sections if none match). Implies includePlexSection.' },
-          sortBy: { type: 'string', enum: ['title', 'year', 'rootFolderPath', 'qualityProfileId', 'qualityProfileName', 'contentRating', 'status', 'plexLibrarySectionName'], description: 'Optional result sort key.' },
-          sortDirection: { type: 'string', enum: ['asc', 'desc'], default: 'asc' },
+          maxContentRating: { type: 'string', enum: [...MOVIE_RATING_ORDER, ...TV_RATING_ORDER], description: 'Maximum allowed rating. Supply one movie OR TV code; for mediaType=all the plugin converts it to the other system (for example PG-13 resolves to movie PG-13 and TV-14). The resolved pair is returned. Use the explicit overrides for a custom household policy.' },
+          movieMaxRating: { type: 'string', enum: MOVIE_RATING_ORDER, description: 'Optional movie-specific maximum; overrides the converted movie ceiling.' },
+          showMaxRating: { type: 'string', enum: TV_RATING_ORDER, description: 'Optional TV-specific maximum; overrides the converted TV ceiling.' },
+          includeLocationName: { type: ['string', 'array'], items: { type: 'string' }, description: 'Caller-defined location text to include. A title matches when the text appears in either its root folder path or its Plex library section name.' },
+          excludeLocationName: { type: ['string', 'array'], items: { type: 'string' }, description: 'Caller-defined location text to exclude. A title is excluded when the text appears in either its root folder path or its Plex library section name.' },
           limit: { type: 'number', default: 50, description: 'Maximum items returned per media type. Capped at 200.' },
           offset: { type: 'number', default: 0, description: 'Offset per media type for paging.' },
         },
+        // Older API clients can continue sending the former advanced filters,
+        // but those fields are no longer advertised to a planning model.
+        additionalProperties: true,
       },
       async execute(input) {
         const mediaType = String(input.mediaType ?? 'all');
@@ -418,10 +517,11 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
         const qualityProfileIds = numberFilters(input.qualityProfileId, input.qualityProfileIds);
         const qualityProfileNames = stringFilters(input.qualityProfileName, input.qualityProfileNames);
         const contentRatings = stringFilters(input.contentRating, input.contentRatings, input.certification);
-        const ratingOperator = stringParam(input.ratingOperator);
-        const ratingValue = stringParam(input.ratingValue);
-        const movieRatingValue = stringParam(input.movieRatingValue) || ratingValue;
-        const showRatingValue = stringParam(input.showRatingValue) || ratingValue;
+        const resolvedRatings = resolveMixedRatingCeilings(input);
+        if (resolvedRatings.error) return { error: resolvedRatings.error };
+        const ratingOperator = resolvedRatings.operator;
+        const movieRatingValue = resolvedRatings.movieValue;
+        const showRatingValue = resolvedRatings.showValue;
         const statusFilters = stringFilters(input.status);
         const years = numberFilters(input.year, input.years);
         const monitored = boolParam(input.monitored);
@@ -431,22 +531,31 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
         const plexSectionNames = stringFilters(input.plexLibrarySectionName, input.plexLibrarySectionNames, input.libraryName);
         const plexSectionIds = stringFilters(input.plexLibrarySectionId, input.plexLibrarySectionIds);
         const excludePlexSectionNames = stringFilters(input.excludePlexLibrarySectionName, input.excludePlexLibrarySectionNames);
-        const needsPlexSection = Boolean(input.includePlexSection) || plexSectionNames.length > 0 || plexSectionIds.length > 0 || excludePlexSectionNames.length > 0;
+        const includeLocationFilters = stringFilters(input.includeLocationName, input.includeLocationNames);
+        const excludeLocationFilters = stringFilters(input.excludeLocationName, input.excludeLocationNames);
+        const hasCombinedLocationFilter = includeLocationFilters.length > 0 || excludeLocationFilters.length > 0;
+        const needsPlexSection = Boolean(input.includePlexSection) || plexSectionNames.length > 0 || plexSectionIds.length > 0 || excludePlexSectionNames.length > 0 || hasCombinedLocationFilter;
         const { limit, offset } = getPaging(input, 50, 200);
         const sortBy = stringParam(input.sortBy);
         const sortDirection = stringParam(input.sortDirection || 'asc');
-        const result: Record<string, unknown> = {};
+        const result: Record<string, unknown> = resolvedRatings.policy ? { ratingPolicy: resolvedRatings.policy } : {};
 
         const operatorError = validateRatingOperator(ratingOperator);
         if (operatorError) return { error: operatorError };
 
         let plexCatalogIndex: ReturnType<typeof buildPlexCatalogIndex> | undefined;
+        if (hasCombinedLocationFilter && !clients.plex) {
+          return { error: 'includeLocationName/excludeLocationName require Plex so both root folders and library section names can be checked.' };
+        }
         if (needsPlexSection && clients.plex) {
           const sectionFilterError = await validatePlexSectionFilters(plexSectionNames, plexSectionIds, excludePlexSectionNames);
           if (sectionFilterError) return { error: sectionFilterError };
           try {
             plexCatalogIndex = buildPlexCatalogIndex(await clients.plex.getLibraryMedia());
           } catch (e) {
+            if (hasCombinedLocationFilter) {
+              return { error: `Cannot safely apply the combined root-folder/Plex-section location filter: ${e}` };
+            }
             result.plexSectionError = String(e);
           }
         }
@@ -480,6 +589,7 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
                 contentRating: contentRating || undefined,
                 plexLibrarySectionId: plexMatch?.sectionId,
                 plexLibrarySectionName: plexMatch?.sectionName,
+                plexLibrarySectionKnown: Boolean(plexMatch),
               };
             });
             mapped = filterRecords(mapped, {
@@ -500,13 +610,18 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
                 { key: 'monitored', value: monitored },
                 { key: 'hasFile', value: hasFile },
               ],
-            }).filter(m => {
+            });
+            let movieLocationUnknown = 0;
+            mapped = mapped.filter(m => {
               if (!matchesContentRatingFilters(m.contentRating, contentRatings)) return false;
               if (Number.isFinite(minYear) && Number(m.year) < Number(minYear)) return false;
               if (Number.isFinite(maxYear) && Number(m.year) > Number(maxYear)) return false;
               if (ratingOperator && movieRatingValue && !matchesRatingOperator(m.contentRating, 'movie', ratingOperator, movieRatingValue)) return false;
               if (excludeRootFolderFilters.length && matchesStringFilters(m.rootFolderPath, excludeRootFolderFilters)) return false;
               if (excludePlexSectionNames.length && matchesStringFilters(m.plexLibrarySectionName, excludePlexSectionNames)) return false;
+              const location = combinedLocationDecision(m, includeLocationFilters, excludeLocationFilters);
+              if (location.unknown) movieLocationUnknown += 1;
+              if (!location.include) return false;
               return true;
             });
             mapped = sortRecords(mapped, sortBy, sortDirection);
@@ -528,6 +643,7 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
             result.movieTotal = mapped.length;
             result.movieReturned = paged.length;
             result.movieHasMore = offset + paged.length < mapped.length;
+            if (hasCombinedLocationFilter) result.movieLocationUnknownExcluded = movieLocationUnknown;
           } catch (e) {
             result.moviesError = String(e);
           }
@@ -565,6 +681,7 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
                 contentRating: contentRating || undefined,
                 plexLibrarySectionId: plexMatch?.sectionId,
                 plexLibrarySectionName: plexMatch?.sectionName,
+                plexLibrarySectionKnown: Boolean(plexMatch),
               };
             });
             mapped = filterRecords(mapped, {
@@ -585,13 +702,18 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
                 { key: 'monitored', value: monitored },
                 { key: 'hasFile', value: hasFile },
               ],
-            }).filter(s => {
+            });
+            let seriesLocationUnknown = 0;
+            mapped = mapped.filter(s => {
               if (!matchesContentRatingFilters(s.contentRating, contentRatings)) return false;
               if (Number.isFinite(minYear) && Number(s.year) < Number(minYear)) return false;
               if (Number.isFinite(maxYear) && Number(s.year) > Number(maxYear)) return false;
               if (ratingOperator && showRatingValue && !matchesRatingOperator(s.contentRating, 'show', ratingOperator, showRatingValue)) return false;
               if (excludeRootFolderFilters.length && matchesStringFilters(s.rootFolderPath, excludeRootFolderFilters)) return false;
               if (excludePlexSectionNames.length && matchesStringFilters(s.plexLibrarySectionName, excludePlexSectionNames)) return false;
+              const location = combinedLocationDecision(s, includeLocationFilters, excludeLocationFilters);
+              if (location.unknown) seriesLocationUnknown += 1;
+              if (!location.include) return false;
               return true;
             });
             mapped = sortRecords(mapped, sortBy, sortDirection);
@@ -615,6 +737,7 @@ export function buildPlexTools(clients: ToolClients): ToolDefinition[] {
             result.seriesTotal = mapped.length;
             result.seriesReturned = paged.length;
             result.seriesHasMore = offset + paged.length < mapped.length;
+            if (hasCombinedLocationFilter) result.seriesLocationUnknownExcluded = seriesLocationUnknown;
           } catch (e) {
             result.seriesError = String(e);
           }
